@@ -114,15 +114,20 @@ def write_to_sheet(parsed):
 
 
 def process_invoice(images_base64):
+    print(f"[process_invoice] старт, фото в накладной: {len(images_base64)}", flush=True)
     try:
         parsed = recognize_invoice(images_base64)
+        print(f"[process_invoice] распознано: {parsed}", flush=True)
     except Exception as e:
+        print(f"[process_invoice] ОШИБКА распознавания: {repr(e)}", flush=True)
         tg_send_message(MANAGER_CHAT_ID, f"⚠️ Не удалось распознать накладную.\nОшибка: {e}")
         return
 
     try:
         result = write_to_sheet(parsed)
+        print(f"[process_invoice] результат записи: {result}", flush=True)
     except Exception as e:
+        print(f"[process_invoice] ОШИБКА записи в таблицу: {repr(e)}", flush=True)
         tg_send_message(
             MANAGER_CHAT_ID,
             f"⚠️ Накладная распознана, но НЕ записалась в таблицу.\n"
@@ -155,26 +160,33 @@ def process_invoice(images_base64):
 def album_flusher():
     """Фоновый поток: следит за накопленными альбомами фото и обрабатывает их,
     когда новых фото в альбом не поступало некоторое время."""
+    print("[album_flusher] фоновый поток запущен", flush=True)
     while True:
-        time.sleep(1)
-        now = time.time()
-        to_process = []
-        with albums_lock:
-            for gid in list(pending_albums.keys()):
-                entry = pending_albums[gid]
-                if now - entry["ts"] > ALBUM_FLUSH_DELAY:
-                    to_process.append(entry["images"])
-                    del pending_albums[gid]
-        for images in to_process:
-            process_invoice(images)
+        try:
+            time.sleep(1)
+            now = time.time()
+            to_process = []
+            with albums_lock:
+                for gid in list(pending_albums.keys()):
+                    entry = pending_albums[gid]
+                    if now - entry["ts"] > ALBUM_FLUSH_DELAY:
+                        to_process.append(entry["images"])
+                        del pending_albums[gid]
+            for images in to_process:
+                print(f"[album_flusher] обрабатываю альбом, фото: {len(images)}", flush=True)
+                process_invoice(images)
+        except Exception as e:
+            print(f"[album_flusher] ОШИБКА в фоновом потоке: {repr(e)}", flush=True)
 
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
     update = request.get_json(silent=True) or {}
+    print(f"[webhook] получено обновление: {update}", flush=True)
     msg = update.get("message")
 
     if not msg:
+        print("[webhook] в обновлении нет message, пропускаю", flush=True)
         return "ok"
 
     if "text" in msg and msg["text"].strip() == "/start":
@@ -186,16 +198,20 @@ def webhook():
         return "ok"
 
     if "photo" not in msg:
+        print("[webhook] в message нет photo, пропускаю", flush=True)
         return "ok"
 
     file_id = msg["photo"][-1]["file_id"]  # самое крупное по размеру фото
     media_group_id = msg.get("media_group_id")
+    print(f"[webhook] фото получено, media_group_id={media_group_id}", flush=True)
 
     try:
         file_path = tg_get_file_path(file_id)
         img_bytes = tg_download_file(file_path)
         img_b64 = base64.b64encode(img_bytes).decode()
+        print(f"[webhook] фото скачано, размер base64: {len(img_b64)}", flush=True)
     except Exception as e:
+        print(f"[webhook] ОШИБКА скачивания фото: {repr(e)}", flush=True)
         tg_send_message(MANAGER_CHAT_ID, f"⚠️ Не удалось загрузить фото из Telegram: {e}")
         return "ok"
 
@@ -204,7 +220,9 @@ def webhook():
             entry = pending_albums.setdefault(media_group_id, {"images": [], "ts": time.time()})
             entry["images"].append(img_b64)
             entry["ts"] = time.time()
+        print(f"[webhook] фото добавлено в альбом {media_group_id}, всего в альбоме: {len(entry['images'])}", flush=True)
     else:
+        print("[webhook] одиночное фото, обрабатываю сразу (синхронно)", flush=True)
         process_invoice([img_b64])
 
     return "ok"
