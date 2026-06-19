@@ -181,6 +181,7 @@ def album_flusher():
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
+    ensure_flusher_started()
     update = request.get_json(silent=True) or {}
     print(f"[webhook] получено обновление: {update}", flush=True)
     msg = update.get("message")
@@ -233,7 +234,19 @@ def health():
     return "Бот работает"
 
 
-threading.Thread(target=album_flusher, daemon=True).start()
+_flusher_started = False
+_flusher_lock = threading.Lock()
+
+
+def ensure_flusher_started():
+    global _flusher_started
+    if _flusher_started:
+        return
+    with _flusher_lock:
+        if not _flusher_started:
+            threading.Thread(target=album_flusher, daemon=True).start()
+            _flusher_started = True
+            print("[ensure_flusher_started] фоновый поток запущен внутри воркера", flush=True)
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
