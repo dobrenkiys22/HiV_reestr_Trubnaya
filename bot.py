@@ -119,6 +119,7 @@ def recognize_invoice(images_base64, caption=""):
             resp.raise_for_status()
             data = resp.json()
             text = "".join(block.get("text", "") for block in data.get("content", []))
+            print(f"[recognize_invoice] попытка {attempt}: сырой текст ответа модели: {text!r}", flush=True)
             clean = text.replace("```json", "").replace("```", "").strip()
             if not clean:
                 raise ValueError(f"Пустой ответ от ИИ (попытка {attempt}). Полный ответ API: {data}")
