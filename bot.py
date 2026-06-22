@@ -53,6 +53,15 @@ SYSTEM_PROMPT = (
     "или продолжение таблицы) — анализируй их как единый документ. "
     "Найди: точное название поставщика (юридическое лицо из реквизитов 'Продавец' / "
     "'Грузоотправитель'), дату поставки/отгрузки, итоговую сумму С НДС. "
+    "Помимо фото, тебе может быть передана ТЕКСТОВАЯ ПОДПИСЬ к сообщению — это то, что "
+    "бармен вручную написал при отправке фото (например, название поставщика и/или дату). "
+    "Используй подпись как дополнительный надёжный источник: если на фото название "
+    "поставщика нечитаемо, размыто, обрезано или текст слишком мелкий — ориентируйся на "
+    "подпись. Если и подпись, и фото читаются, но ЯВНО противоречат друг другу (разные "
+    "поставщики или сильно разные даты) — выбери вариант с фото как основной источник "
+    "(это первичный документ), но обязательно укажи это противоречие в kommentarii и "
+    "поставь uverennost 'low', чтобы менеджер проверил вручную. Если подписи нет вообще — "
+    "ориентируйся только на фото, это нормальная ситуация. "
     "ПРАВИЛО ПОИСКА СУММЫ: ищи строку, где написано именно 'Всего к оплате' или "
     "'Итого с НДС' (или 'Стоимость товаров... с налогом — всего' в самой нижней итоговой "
     "строке таблицы) — бери число из ЭТОЙ строки, из колонки 'Стоимость... с налогом — всего' "
@@ -76,12 +85,15 @@ SYSTEM_PROMPT = (
 )
 
 
-def recognize_invoice(images_base64):
+def recognize_invoice(images_base64, caption=""):
     content = [
         {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": img}}
         for img in images_base64
     ]
-    content.append({"type": "text", "text": "Распознай эту накладную и верни только JSON."})
+    user_text = "Распознай эту накладную и верни только JSON."
+    if caption:
+        user_text += f"\n\nТекстовая подпись бармена к этому сообщению: «{caption}»"
+    content.append({"type": "text", "text": user_text})
 
     last_error = None
     for attempt in range(1, 3):  # одна попытка + один автоповтор
@@ -134,10 +146,10 @@ def write_to_sheet(parsed):
     return r.json()
 
 
-def process_invoice(images_base64):
-    print(f"[process_invoice] старт, фото в накладной: {len(images_base64)}", flush=True)
+def process_invoice(images_base64, caption=""):
+    print(f"[process_invoice] старт, фото в накладной: {len(images_base64)}, подпись: {caption!r}", flush=True)
     try:
-        parsed = recognize_invoice(images_base64)
+        parsed = recognize_invoice(images_base64, caption)
         print(f"[process_invoice] распознано: {parsed}", flush=True)
     except Exception as e:
         print(f"[process_invoice] ОШИБКА распознавания: {repr(e)}", flush=True)
@@ -160,13 +172,15 @@ def process_invoice(images_base64):
         warn = ""
         if parsed.get("uverennost") in ("low", "medium"):
             warn = "\n⚠️ Не 100% уверенность в распознавании — пожалуйста, проверь эту строку."
+        if parsed.get("kommentarii"):
+            warn += f"\n📝 {parsed.get('kommentarii')}"
         pokup = f" ({parsed.get('pokupatel')})" if parsed.get("pokupatel") else ""
         tg_send_message(
             MANAGER_CHAT_ID,
             f"✅ Записано: {parsed.get('postavshik')}{pokup}\n"
-            f"Дата: {parsed.get('date')} | Сумма: {parsed.get('summa')}\n"
-            f"Комментарий: {parsed.get('kommentarii') or '—'}\n"
-            f"Строка {result.get('row')} в листе «{result.get('sheet')}»{warn}",
+            f"Дата: {parsed.get('date')} | Сумма: {parsed.get('summa')}"
+            f"{warn}\n"
+            f"Строка {result.get('row')} в листе «{result.get('sheet')}»",
         )
     else:
         tg_send_message(
@@ -190,11 +204,11 @@ def album_flusher():
                 for gid in list(pending_albums.keys()):
                     entry = pending_albums[gid]
                     if now - entry["ts"] > ALBUM_FLUSH_DELAY:
-                        to_process.append(entry["images"])
+                        to_process.append({"images": entry["images"], "caption": entry["caption"]})
                         del pending_albums[gid]
-            for images in to_process:
-                print(f"[album_flusher] обрабатываю альбом, фото: {len(images)}", flush=True)
-                process_invoice(images)
+            for entry_data in to_process:
+                print(f"[album_flusher] обрабатываю альбом, фото: {len(entry_data['images'])}, подпись: {entry_data['caption']!r}", flush=True)
+                process_invoice(entry_data["images"], entry_data["caption"])
         except Exception as e:
             print(f"[album_flusher] ОШИБКА в фоновом потоке: {repr(e)}", flush=True)
 
@@ -224,7 +238,8 @@ def webhook():
 
     file_id = msg["photo"][-1]["file_id"]  # самое крупное по размеру фото
     media_group_id = msg.get("media_group_id")
-    print(f"[webhook] фото получено, media_group_id={media_group_id}", flush=True)
+    caption = (msg.get("caption") or "").strip()
+    print(f"[webhook] фото получено, media_group_id={media_group_id}, caption={caption!r}", flush=True)
 
     try:
         file_path = tg_get_file_path(file_id)
@@ -238,13 +253,15 @@ def webhook():
 
     if media_group_id:
         with albums_lock:
-            entry = pending_albums.setdefault(media_group_id, {"images": [], "ts": time.time()})
+            entry = pending_albums.setdefault(media_group_id, {"images": [], "caption": "", "ts": time.time()})
             entry["images"].append(img_b64)
+            if caption:
+                entry["caption"] = caption
             entry["ts"] = time.time()
         print(f"[webhook] фото добавлено в альбом {media_group_id}, всего в альбоме: {len(entry['images'])}", flush=True)
     else:
         print("[webhook] одиночное фото, обрабатываю сразу (синхронно)", flush=True)
-        process_invoice([img_b64])
+        process_invoice([img_b64], caption)
 
     return "ok"
 
