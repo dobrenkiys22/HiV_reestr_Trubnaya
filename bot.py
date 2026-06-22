@@ -83,26 +83,38 @@ def recognize_invoice(images_base64):
     ]
     content.append({"type": "text", "text": "Распознай эту накладную и верни только JSON."})
 
-    resp = requests.post(
-        "https://api.anthropic.com/v1/messages",
-        headers={
-            "x-api-key": ANTHROPIC_API_KEY,
-            "anthropic-version": "2023-06-01",
-            "content-type": "application/json",
-        },
-        json={
-            "model": "claude-sonnet-4-6",
-            "max_tokens": 1000,
-            "system": SYSTEM_PROMPT,
-            "messages": [{"role": "user", "content": content}],
-        },
-        timeout=60,
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    text = "".join(block.get("text", "") for block in data.get("content", []))
-    clean = text.replace("```json", "").replace("```", "").strip()
-    return json.loads(clean)
+    last_error = None
+    for attempt in range(1, 3):  # одна попытка + один автоповтор
+        try:
+            resp = requests.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "x-api-key": ANTHROPIC_API_KEY,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                },
+                json={
+                    "model": "claude-sonnet-4-6",
+                    "max_tokens": 1000,
+                    "system": SYSTEM_PROMPT,
+                    "messages": [{"role": "user", "content": content}],
+                },
+                timeout=60,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            text = "".join(block.get("text", "") for block in data.get("content", []))
+            clean = text.replace("```json", "").replace("```", "").strip()
+            if not clean:
+                raise ValueError(f"Пустой ответ от ИИ (попытка {attempt}). Полный ответ API: {data}")
+            return json.loads(clean)
+        except Exception as e:
+            last_error = e
+            print(f"[recognize_invoice] попытка {attempt} не удалась: {repr(e)}", flush=True)
+            if attempt == 1:
+                time.sleep(2)
+                continue
+    raise last_error
 
 
 def write_to_sheet(parsed):
