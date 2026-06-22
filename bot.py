@@ -1,5 +1,6 @@
 import os
 import json
+import re
 import base64
 import time
 import threading
@@ -76,6 +77,11 @@ SYSTEM_PROMPT = (
     "Ответь СТРОГО в виде JSON без markdown, без обратных кавычек и без пояснений, по схеме: "
     '{"postavshik":string,"pokupatel":string или "","date":string в формате ДД.MM.ГГГГ,'
     '"summa":number или null,"kommentarii":string,"uverennost":"high" или "medium" или "low"}. '
+    "КРИТИЧЕСКИ ВАЖНО: твой ответ должен начинаться сразу с символа { и заканчиваться символом }. "
+    "Не пиши вообще никаких слов, рассуждений или объяснений до или после JSON — даже если ты "
+    "не уверен или документ неполный (например, видна только часть многостраничного документа). "
+    "Любую неуверенность или замечание (например, 'это страница 1 из 3, итоговая сумма "
+    "недоступна') помещай ВНУТРЬ поля kommentarii, а не в виде текста снаружи JSON. "
     "Поле kommentarii в норме должно быть ПУСТОЙ строкой. Заполняй его только если есть "
     "существенное сомнение в дате, сумме или поставщике — тогда коротко (одна фраза) опиши "
     "именно эту неуверенность. "
@@ -120,7 +126,8 @@ def recognize_invoice(images_base64, caption=""):
             data = resp.json()
             text = "".join(block.get("text", "") for block in data.get("content", []))
             print(f"[recognize_invoice] попытка {attempt}: сырой текст ответа модели: {text!r}", flush=True)
-            clean = text.replace("```json", "").replace("```", "").strip()
+            json_match = re.search(r"\{.*\}", text, re.DOTALL)
+            clean = json_match.group(0) if json_match else text.strip()
             if not clean:
                 raise ValueError(f"Пустой ответ от ИИ (попытка {attempt}). Полный ответ API: {data}")
             return json.loads(clean)
