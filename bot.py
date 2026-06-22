@@ -113,6 +113,9 @@ def recognize_invoice(images_base64, caption=""):
                 },
                 timeout=60,
             )
+            print(f"[recognize_invoice] попытка {attempt}: HTTP {resp.status_code}, длина тела ответа: {len(resp.text)}", flush=True)
+            if resp.status_code != 200:
+                print(f"[recognize_invoice] тело ответа при ошибке: {resp.text[:500]}", flush=True)
             resp.raise_for_status()
             data = resp.json()
             text = "".join(block.get("text", "") for block in data.get("content", []))
