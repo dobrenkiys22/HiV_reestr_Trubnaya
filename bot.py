@@ -136,7 +136,7 @@ def write_to_sheet(parsed):
         "date": parsed.get("date", ""),
         "nomer": "",
         "summa": parsed.get("summa") if parsed.get("summa") is not None else "",
-        "kommentarii": parsed.get("kommentarii", ""),
+        "kommentarii": "",
     }
     if parsed.get("pokupatel"):
         params["pokupatel"] = parsed["pokupatel"]
