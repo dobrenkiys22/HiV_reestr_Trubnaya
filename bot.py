@@ -506,14 +506,20 @@ def format_sverka_summary(result):
     total_matched = sum(r.get("matched", 0) for r in results if "error" not in r)
     total_mismatches = sum(len(r.get("mismatches", [])) for r in results if "error" not in r)
     total_missing_in_buh = sum(len(r.get("missingInBuh", [])) for r in results if "error" not in r)
+    total_duplicates = sum(
+        len(r.get("duplicatesBuh", [])) + len(r.get("duplicatesOurs", []))
+        for r in results if "error" not in r
+    )
     errors = [r for r in results if "error" in r]
 
     lines = [
         "📊 Сверка завершена",
         f"✅ Совпало: {total_matched} накладных",
     ]
-    if total_mismatches or total_missing_in_buh:
-        lines.append(f"⚠️ Расхождений: {total_mismatches + total_missing_in_buh}")
+    if total_mismatches or total_missing_in_buh or total_duplicates:
+        lines.append(f"⚠️ Расхождений: {total_mismatches + total_missing_in_buh + total_duplicates}")
+    else:
+        lines.append("🎉 Расхождений не найдено, всё сошлось!")
     lines.append("")
 
     for r in results:
