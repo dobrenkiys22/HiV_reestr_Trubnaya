@@ -4,6 +4,7 @@ import re
 import base64
 import time
 import threading
+import uuid
 
 from flask import Flask, request
 import requests
@@ -23,6 +24,14 @@ pending_albums = {}
 ALBUM_FLUSH_DELAY = 3  # секунд ожидания, прежде чем считать альбом собранным
 albums_lock = threading.Lock()
 
+# Накладные, ожидающие подтверждения суммы от менеджера (когда ИИ не уверен)
+pending_confirmations = {}
+confirmations_lock = threading.Lock()
+
+# Чаты, где менеджер должен прислать сумму вручную текстом (после нажатия "Другое")
+awaiting_manual_sum = {}
+awaiting_lock = threading.Lock()
+
 
 def tg_get_file_path(file_id):
     r = requests.get(f"{TELEGRAM_API}/getFile", params={"file_id": file_id}, timeout=30)
@@ -36,15 +45,37 @@ def tg_download_file(file_path):
     return r.content
 
 
-def tg_send_message(chat_id, text):
+def tg_send_message(chat_id, text, reply_markup=None):
+    payload = {"chat_id": chat_id, "text": text}
+    if reply_markup:
+        payload["reply_markup"] = json.dumps(reply_markup)
+    try:
+        r = requests.post(f"{TELEGRAM_API}/sendMessage", json=payload, timeout=15)
+        return r.json()
+    except Exception as e:
+        print("Не удалось отправить сообщение в Telegram:", e)
+        return None
+
+
+def tg_answer_callback_query(callback_query_id, text=None):
+    try:
+        payload = {"callback_query_id": callback_query_id}
+        if text:
+            payload["text"] = text
+        requests.post(f"{TELEGRAM_API}/answerCallbackQuery", json=payload, timeout=15)
+    except Exception as e:
+        print("Не удалось ответить на callback_query:", e)
+
+
+def tg_remove_keyboard(chat_id, message_id):
     try:
         requests.post(
-            f"{TELEGRAM_API}/sendMessage",
-            json={"chat_id": chat_id, "text": text},
+            f"{TELEGRAM_API}/editMessageReplyMarkup",
+            json={"chat_id": chat_id, "message_id": message_id, "reply_markup": json.dumps({"inline_keyboard": []})},
             timeout=15,
         )
     except Exception as e:
-        print("Не удалось отправить сообщение в Telegram:", e)
+        print("Не удалось убрать кнопки:", e)
 
 
 SYSTEM_PROMPT = (
@@ -97,29 +128,28 @@ SYSTEM_PROMPT = (
     "итоговой строке, в столбце с заголовком вроде 'Стоимость товаров... с налогом — всего'. "
     "НИКОГДА не вычисляй и не складывай числа сам — каждое из трёх чисел уже напечатано "
     "готовым на документе, просто прочитай и распредели их по соответствующим полям. "
-    "ОСОБЫЙ СЛУЧАЙ — РАЗБИВКА ПО СТАВКАМ НДС: если в накладной товары облагаются разными "
-    "ставками НДС (например, 10% и 22%), строка 'Всего к оплате' может быть напечатана как "
-    "просто заголовок-разделитель БЕЗ чисел в ней, а суммы идут отдельными строками ниже — "
-    "'Всего НДС 10%', 'Всего НДС 22%' и т.п. Это нормальный, штатный формат документа. "
-    "ЭТОТ СЛУЧАЙ СЛОЖНЫЙ И ЛЕГКО ОШИБИТЬСЯ — не пытайся сам складывать строки и угадывать "
-    "итог. Вместо этого: поставь uverennost 'low', в summa укажи null, а в kommentarii выпиши "
-    "ВСЕ найденные числа из колонки 'с налогом — всего' по каждой строке ставки НДС (например: "
-    "'Несколько ставок НДС: 10% = 20370.40, 22% = 12546.00 — нужна проверка менеджером, какие "
-    "строки относятся к этой накладной'). Менеджер сам решит, какие числа учитывать. "
-    "ЕСЛИ НА ПЕРЕДАННОМ ТЕБЕ ФОТО ЕСТЬ ОДНА ЯСНАЯ ИТОГОВАЯ СТРОКА С ЧИСЛОМ — нужное число (в) "
-    "ОБЯЗАТЕЛЬНО можно определить, отказываться нельзя (кроме описанного выше особого случая "
-    "с разбивкой по ставкам НДС, где summa:null — это правильный ответ). "
+    "КАНДИДАТЫ ПРИ НЕОДНОЗНАЧНОСТИ: если ты видишь НЕСКОЛЬКО правдоподобных чисел на роль "
+    "итоговой суммы и не можешь точно решить, какое из них верное (например: разбивка по "
+    "ставкам НДС без единой готовой суммы; или на разных страницах/фото видны разные похожие "
+    "по смыслу 'итоговые' числа, и непонятно, какое из них — общий итог, а какое — частичный "
+    "подытог) — НЕ выбирай и не вычисляй сам. Вместо этого заполни summa:null и заполни поле "
+    "summa_candidates списком ВСЕХ правдоподобных чисел-кандидатов (просто числа, без текста), "
+    "которые ты нашёл — менеджер сам выберет верное. Опиши в kommentarii коротко, что это за "
+    "числа и откуда каждое взялось (например: '10% НДС = 20370.40, 22% НДС = 12546.00'). "
+    "Если ты УВЕРЕН, какое число правильное — просто заполни summa этим числом, оставь "
+    "summa_candidates пустым списком [], и НЕ создавай искусственную неуверенность — это "
+    "должно происходить редко, только в реально сложных/неоднозначных случаях. "
     "СЛУЖЕБНЫЕ НАДПИСИ ТИПА 'Страница 1 из 3', 'Документ составлен на N листах', "
     "'Имеет продолжение на...' и подобные — это просто формальные реквизиты бланка документа, "
     "они НЕ ОЗНАЧАЮТ, что сумма на этом фото неполная или недостоверная, и НЕ ЯВЛЯЮТСЯ "
     "указанием, что тебе не хватает данных. ПОЛНОСТЬЮ ИГНОРИРУЙ такие надписи при принятии "
     "решения о сумме. "
-    "Тебе НЕЛЬЗЯ отказываться определить сумму, писать summa:null или объяснять, что 'нужны "
-    "другие страницы' — если на фото, которое тебе передали, есть итоговая строка с числами, "
-    "указывай summa и ставь uverennost 'high'. Поле summa:null допустимо ТОЛЬКО если на "
-    "фото вообще никакой итоговой строки с суммами не видно. "
+    "Если на фото есть одна ясная итоговая строка с числом — указывай summa и ставь "
+    "uverennost 'high', не создавай неуверенность искусственно. "
     "Если тебе передали несколько фото ОДНОГО документа — используй итоговую строку с "
-    "ПОСЛЕДНЕГО из переданных фото, где она есть. "
+    "ПОСЛЕДНЕГО из переданных фото, где она есть. Если на разных фото видны РАЗНЫЕ по "
+    "смыслу 'итоговые' числа и неясно, какое из них общий итог — это и есть случай для "
+    "summa_candidates, см. выше. "
     "Работай только с тем, что реально видно на переданных тебе фото — не предполагай, не "
     "довоображай и не учитывай содержимое страниц, которых тебе не показали. "
     "Если поставщик — ООО 'МИЛАРИ', дополнительно определи покупателя по реквизитам покупателя/"
@@ -127,12 +157,13 @@ SYSTEM_PROMPT = (
     "Ответь СТРОГО в виде JSON без markdown, без обратных кавычек и без пояснений, по схеме: "
     '{"postavshik":string,"pokupatel":string или "","date":string в формате ДД.MM.ГГГГ,'
     '"summa_bez_naloga":number или null,"summa_naloga":number или null,'
-    '"summa":number или null,"kommentarii":string,"uverennost":"high" или "medium" или "low"}. '
+    '"summa":number или null,"summa_candidates":[number, ...] или [],'
+    '"kommentarii":string,"uverennost":"high" или "medium" или "low"}. '
     "КРИТИЧЕСКИ ВАЖНО: твой ответ должен начинаться сразу с символа { и заканчиваться символом }. "
     "Не пиши вообще никаких слов, рассуждений или объяснений до или после JSON — даже если ты "
     "не уверен или документ неполный (например, видна только часть многостраничного документа). "
-    "Любую неуверенность или замечание (например, 'это страница 1 из 3, итоговая сумма "
-    "недоступна') помещай ВНУТРЬ поля kommentarii, а не в виде текста снаружи JSON. "
+    "Любую неуверенность или замечание помещай ВНУТРЬ поля kommentarii, а не в виде текста "
+    "снаружи JSON. "
     "Поле kommentarii в норме должно быть ПУСТОЙ строкой. Заполняй его только если есть "
     "существенное сомнение в дате, сумме или поставщике — тогда коротко (одна фраза) опиши "
     "именно эту неуверенность. "
@@ -191,21 +222,65 @@ def recognize_invoice(images_base64, caption=""):
     raise last_error
 
 
-def write_to_sheet(parsed):
+def write_to_sheet(postavshik, date, summa, pokupatel=""):
     params = {
         "sheet": SHEET_NAME,
-        "supplier": parsed.get("postavshik", ""),
-        "date": parsed.get("date", ""),
+        "supplier": postavshik,
+        "date": date,
         "nomer": "",
-        "summa": parsed.get("summa") if parsed.get("summa") is not None else "",
+        "summa": summa if summa is not None else "",
         "kommentarii": "",
     }
-    if parsed.get("pokupatel"):
-        params["pokupatel"] = parsed["pokupatel"]
+    if pokupatel:
+        params["pokupatel"] = pokupatel
 
     r = requests.get(APPS_SCRIPT_URL, params=params, timeout=30)
     r.raise_for_status()
     return r.json()
+
+
+def format_success_message(postavshik, pokupatel, date, summa, result, extra_note=""):
+    pokup = f" ({pokupatel})" if pokupatel else ""
+    note = f"\n📝 {extra_note}" if extra_note else ""
+    return (
+        f"✅ Записано: {postavshik}{pokup}\n"
+        f"Дата: {date} | Сумма: {summa}"
+        f"{note}\n"
+        f"Строка {result.get('row')} в листе «{result.get('sheet')}»"
+    )
+
+
+def ask_for_sum_confirmation(parsed):
+    """Отправляет менеджеру кнопки с вариантами суммы, ничего не записывая в таблицу пока."""
+    conf_id = uuid.uuid4().hex[:10]
+    candidates = parsed.get("summa_candidates") or []
+    candidates = [c for c in candidates if c is not None]
+
+    with confirmations_lock:
+        pending_confirmations[conf_id] = {
+            "postavshik": parsed.get("postavshik", ""),
+            "pokupatel": parsed.get("pokupatel", ""),
+            "date": parsed.get("date", ""),
+            "candidates": candidates,
+        }
+
+    buttons = []
+    for idx, val in enumerate(candidates):
+        label = f"{val:,.2f} ₽".replace(",", " ")
+        buttons.append([{"text": label, "callback_data": f"csel:{conf_id}:{idx}"}])
+    buttons.append([{"text": "✏️ Другая сумма (введу сам)", "callback_data": f"cman:{conf_id}"}])
+
+    pokup = f" ({parsed.get('pokupatel')})" if parsed.get("pokupatel") else ""
+    text = (
+        f"🤔 Не уверен в сумме для этой накладной.\n"
+        f"Поставщик: {parsed.get('postavshik')}{pokup}\n"
+        f"Дата: {parsed.get('date')}\n"
+    )
+    if parsed.get("kommentarii"):
+        text += f"📝 {parsed.get('kommentarii')}\n"
+    text += "\nВыбери верную сумму:"
+
+    tg_send_message(MANAGER_CHAT_ID, text, reply_markup={"inline_keyboard": buttons})
 
 
 def process_invoice(images_base64, caption=""):
@@ -218,8 +293,21 @@ def process_invoice(images_base64, caption=""):
         tg_send_message(MANAGER_CHAT_ID, f"⚠️ Не удалось распознать накладную.\nОшибка: {e}")
         return
 
+    candidates = [c for c in (parsed.get("summa_candidates") or []) if c is not None]
+    needs_confirmation = bool(candidates) or parsed.get("summa") is None
+
+    if needs_confirmation:
+        print(f"[process_invoice] нужна ручная проверка суммы, кандидаты: {candidates}", flush=True)
+        ask_for_sum_confirmation(parsed)
+        return
+
     try:
-        result = write_to_sheet(parsed)
+        result = write_to_sheet(
+            parsed.get("postavshik", ""),
+            parsed.get("date", ""),
+            parsed.get("summa"),
+            parsed.get("pokupatel", ""),
+        )
         print(f"[process_invoice] результат записи: {result}", flush=True)
     except Exception as e:
         print(f"[process_invoice] ОШИБКА записи в таблицу: {repr(e)}", flush=True)
@@ -231,18 +319,17 @@ def process_invoice(images_base64, caption=""):
         return
 
     if result.get("status") == "ok":
-        warn = ""
+        extra_note = ""
         if parsed.get("uverennost") in ("low", "medium"):
-            warn = "\n⚠️ Не 100% уверенность в распознавании — пожалуйста, проверь эту строку."
+            extra_note = "⚠️ Не 100% уверенность в распознавании — пожалуйста, проверь эту строку."
         if parsed.get("kommentarii"):
-            warn += f"\n📝 {parsed.get('kommentarii')}"
-        pokup = f" ({parsed.get('pokupatel')})" if parsed.get("pokupatel") else ""
+            extra_note = (extra_note + " " if extra_note else "") + parsed.get("kommentarii")
         tg_send_message(
             MANAGER_CHAT_ID,
-            f"✅ Записано: {parsed.get('postavshik')}{pokup}\n"
-            f"Дата: {parsed.get('date')} | Сумма: {parsed.get('summa')}"
-            f"{warn}\n"
-            f"Строка {result.get('row')} в листе «{result.get('sheet')}»",
+            format_success_message(
+                parsed.get("postavshik"), parsed.get("pokupatel"), parsed.get("date"),
+                parsed.get("summa"), result, extra_note,
+            ),
         )
     else:
         tg_send_message(
@@ -275,24 +362,104 @@ def album_flusher():
             print(f"[album_flusher] ОШИБКА в фоновом потоке: {repr(e)}", flush=True)
 
 
+def handle_callback_query(cq):
+    callback_id = cq["id"]
+    data = cq.get("data", "")
+    chat_id = cq["message"]["chat"]["id"]
+    message_id = cq["message"]["message_id"]
+
+    tg_answer_callback_query(callback_id)
+    tg_remove_keyboard(chat_id, message_id)
+
+    if data.startswith("csel:"):
+        _, conf_id, idx_str = data.split(":")
+        idx = int(idx_str)
+        with confirmations_lock:
+            entry = pending_confirmations.pop(conf_id, None)
+        if not entry:
+            tg_send_message(chat_id, "⚠️ Эта накладная уже обработана или устарела.")
+            return
+        try:
+            chosen_summa = entry["candidates"][idx]
+        except IndexError:
+            tg_send_message(chat_id, "⚠️ Не удалось определить выбранный вариант.")
+            return
+        finalize_confirmed_invoice(chat_id, entry, chosen_summa)
+
+    elif data.startswith("cman:"):
+        _, conf_id = data.split(":")
+        with confirmations_lock:
+            entry = pending_confirmations.get(conf_id)
+        if not entry:
+            tg_send_message(chat_id, "⚠️ Эта накладная уже обработана или устарела.")
+            return
+        with awaiting_lock:
+            awaiting_manual_sum[chat_id] = conf_id
+        tg_send_message(chat_id, "Напиши правильную сумму одним сообщением (например: 12345.67)")
+
+
+def finalize_confirmed_invoice(chat_id, entry, chosen_summa):
+    try:
+        result = write_to_sheet(entry["postavshik"], entry["date"], chosen_summa, entry["pokupatel"])
+        print(f"[finalize_confirmed_invoice] результат записи: {result}", flush=True)
+    except Exception as e:
+        tg_send_message(chat_id, f"⚠️ Не удалось записать в таблицу: {e}")
+        return
+
+    if result.get("status") == "ok":
+        tg_send_message(
+            chat_id,
+            format_success_message(entry["postavshik"], entry["pokupatel"], entry["date"], chosen_summa, result),
+        )
+    else:
+        tg_send_message(chat_id, f"❌ Ошибка записи в таблицу: {result.get('message')}")
+
+
 @app.route("/webhook", methods=["POST"])
 def webhook():
     ensure_flusher_started()
     update = request.get_json(silent=True) or {}
     print(f"[webhook] получено обновление: {update}", flush=True)
+
+    if "callback_query" in update:
+        handle_callback_query(update["callback_query"])
+        return "ok"
+
     msg = update.get("message")
 
     if not msg:
         print("[webhook] в обновлении нет message, пропускаю", flush=True)
         return "ok"
 
-    if "text" in msg and msg["text"].strip() == "/start":
-        tg_send_message(
-            msg["chat"]["id"],
-            "Привет! Присылай сюда фото накладных — я распознаю и сам занесу в реестр. "
-            "Если накладная на несколько страниц — отправляй фото как альбом (выбери все сразу).",
-        )
-        return "ok"
+    chat_id = msg["chat"]["id"]
+
+    if "text" in msg:
+        text = msg["text"].strip()
+        if text == "/start":
+            tg_send_message(
+                chat_id,
+                "Привет! Присылай сюда фото накладных — я распознаю и сам занесу в реестр. "
+                "Если накладная на несколько страниц — отправляй фото как альбом (выбери все сразу).",
+            )
+            return "ok"
+
+        with awaiting_lock:
+            conf_id = awaiting_manual_sum.pop(chat_id, None)
+        if conf_id:
+            try:
+                manual_summa = float(text.replace(",", ".").replace(" ", ""))
+            except ValueError:
+                tg_send_message(chat_id, "Не получилось понять число. Напиши просто сумму, например: 12345.67")
+                with awaiting_lock:
+                    awaiting_manual_sum[chat_id] = conf_id
+                return "ok"
+            with confirmations_lock:
+                entry = pending_confirmations.pop(conf_id, None)
+            if not entry:
+                tg_send_message(chat_id, "⚠️ Эта накладная уже обработана или устарела.")
+                return "ok"
+            finalize_confirmed_invoice(chat_id, entry, manual_summa)
+            return "ok"
 
     if "photo" not in msg:
         print("[webhook] в message нет photo, пропускаю", flush=True)
