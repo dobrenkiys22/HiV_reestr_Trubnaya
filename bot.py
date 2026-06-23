@@ -521,7 +521,9 @@ def format_sverka_summary(result):
             continue
         mism = r.get("mismatches", [])
         missing = r.get("missingInBuh", [])
-        if not mism and not missing:
+        dup_buh = r.get("duplicatesBuh", [])
+        dup_ours = r.get("duplicatesOurs", [])
+        if not mism and not missing and not dup_buh and not dup_ours:
             continue
         lines.append(f"— {r['supplier']} —")
         for m in mism:
@@ -531,6 +533,10 @@ def format_sverka_summary(result):
                 lines.append(f"  {m['date']}: {m['buhSumma']} — нет в нашем реестре")
         for mb in missing:
             lines.append(f"  {mb['date']}: {mb['summa']} — есть у нас, нет у буха")
+        for d in r.get("duplicatesBuh", []):
+            lines.append(f"  🔁 Возможный дубль у буха: {d['date']}, сумма {d['summa']} — встречается {d['count']} раз")
+        for d in r.get("duplicatesOurs", []):
+            lines.append(f"  🔁 Возможный дубль у нас: {d['date']}, сумма {d['summa']} — встречается {d['count']} раз")
         lines.append("")
 
     if errors:
