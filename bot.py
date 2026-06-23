@@ -5,7 +5,9 @@ import base64
 import time
 import threading
 import uuid
+from io import BytesIO
 
+import openpyxl
 from flask import Flask, request
 import requests
 
@@ -429,6 +431,125 @@ def finalize_confirmed_invoice(chat_id, entry, chosen_summa):
         tg_send_message(chat_id, f"❌ Ошибка записи в таблицу: {result.get('message')}")
 
 
+SKIP_SUPPLIER_KEYWORDS = ["кухня", "рынок", "магазин"]
+
+
+def parse_sverka_file(file_bytes):
+    """Разбирает xlsx-файл сверки от бухгалтера на блоки по поставщикам.
+    Возвращает список {"name": str, "invoices": [{"date": "ДД.MM.ГГГГ", "summa": float, "concept": str}]}
+    Пропускает внутренние псевдо-поставщики (кухня/рынок/магазин)."""
+    wb = openpyxl.load_workbook(BytesIO(file_bytes), data_only=True)
+    ws = wb[wb.sheetnames[0]]
+
+    suppliers = []
+    current_name = None
+    current_invoices = []
+
+    def flush():
+        if current_name and current_invoices:
+            name_lower = current_name.lower()
+            if not any(k in name_lower for k in SKIP_SUPPLIER_KEYWORDS):
+                suppliers.append({"name": current_name, "invoices": current_invoices})
+
+    for row in ws.iter_rows(min_row=5):
+        b_val = row[1].value if len(row) > 1 else None
+        if isinstance(b_val, str) and b_val.strip().startswith("Поставщик/Покупатель"):
+            flush()
+            name = b_val.split(":", 1)[1].strip() if ":" in b_val else b_val.strip()
+            name = name.lstrip(":").strip()
+            current_name = name
+            current_invoices = []
+            continue
+
+        c_val = row[2].value if len(row) > 2 else None
+        if c_val:
+            d_val = row[3].value if len(row) > 3 else None
+            g_val = row[6].value if len(row) > 6 else None
+            k_val = row[10].value if len(row) > 10 else ""
+            if d_val is not None and g_val is not None:
+                if hasattr(d_val, "strftime"):
+                    date_str = d_val.strftime("%d.%m.%Y")
+                else:
+                    date_str = str(d_val).split(" ")[0]
+                try:
+                    summa_val = round(float(g_val), 2)
+                except (TypeError, ValueError):
+                    continue
+                current_invoices.append({
+                    "date": date_str,
+                    "summa": summa_val,
+                    "concept": str(k_val) if k_val else "",
+                })
+
+    flush()
+    return suppliers
+
+
+def run_sverka(file_bytes):
+    suppliers = parse_sverka_file(file_bytes)
+    print(f"[run_sverka] поставщиков для сверки: {len(suppliers)}", flush=True)
+
+    resp = requests.post(
+        APPS_SCRIPT_URL,
+        json={"action": "compare", "sheet": SHEET_NAME, "suppliers": suppliers},
+        timeout=120,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def format_sverka_summary(result):
+    if result.get("status") != "ok":
+        return f"❌ Ошибка сверки: {result.get('message')}"
+
+    results = result.get("results", [])
+    total_matched = sum(r.get("matched", 0) for r in results if "error" not in r)
+    total_mismatches = sum(len(r.get("mismatches", [])) for r in results if "error" not in r)
+    total_missing_in_buh = sum(len(r.get("missingInBuh", [])) for r in results if "error" not in r)
+    errors = [r for r in results if "error" in r]
+
+    lines = [
+        "📊 Сверка завершена",
+        f"✅ Совпало: {total_matched} накладных",
+    ]
+    if total_mismatches or total_missing_in_buh:
+        lines.append(f"⚠️ Расхождений: {total_mismatches + total_missing_in_buh}")
+    lines.append("")
+
+    for r in results:
+        if "error" in r:
+            continue
+        mism = r.get("mismatches", [])
+        missing = r.get("missingInBuh", [])
+        if not mism and not missing:
+            continue
+        lines.append(f"— {r['supplier']} —")
+        for m in mism:
+            if m["type"] == "сумма не совпадает":
+                lines.append(f"  {m['date']}: у буха {m['buhSumma']}, у нас {m['ourSumma']}")
+            else:
+                lines.append(f"  {m['date']}: {m['buhSumma']} — нет в нашем реестре")
+        for mb in missing:
+            lines.append(f"  {mb['date']}: {mb['summa']} — есть у нас, нет у буха")
+        lines.append("")
+
+    if errors:
+        lines.append("⚠️ Не удалось сверить:")
+        for e in errors:
+            lines.append(f"  {e['supplier']}: {e['error']}")
+
+    return "\n".join(lines)
+
+
+def send_long_message(chat_id, text):
+    """Telegram режет сообщения длиннее ~4096 символов — разбиваем по частям."""
+    LIMIT = 3800
+    while text:
+        chunk = text[:LIMIT]
+        tg_send_message(chat_id, chunk)
+        text = text[LIMIT:]
+
+
 @app.route("/webhook", methods=["POST"])
 def webhook():
     ensure_flusher_started()
@@ -476,7 +597,24 @@ def webhook():
             return "ok"
 
     if "photo" not in msg:
-        print("[webhook] в message нет photo, пропускаю", flush=True)
+        if "document" in msg:
+            doc = msg["document"]
+            file_name = doc.get("file_name", "")
+            if file_name.lower().endswith((".xlsx", ".xls")):
+                tg_send_message(chat_id, "🔄 Получил файл сверки, сравниваю с реестром...")
+                try:
+                    file_path = tg_get_file_path(doc["file_id"])
+                    file_bytes = tg_download_file(file_path)
+                    result = run_sverka(file_bytes)
+                    summary = format_sverka_summary(result)
+                    send_long_message(chat_id, summary)
+                except Exception as e:
+                    print(f"[webhook] ОШИБКА сверки: {repr(e)}", flush=True)
+                    tg_send_message(chat_id, f"⚠️ Не удалось выполнить сверку: {e}")
+            else:
+                tg_send_message(chat_id, "Это не похоже на xlsx-файл сверки — присылай файл от бухгалтера в формате Excel.")
+        else:
+            print("[webhook] в message нет photo и нет document, пропускаю", flush=True)
         return "ok"
 
     file_id = msg["photo"][-1]["file_id"]  # самое крупное по размеру фото
@@ -530,4 +668,3 @@ def ensure_flusher_started():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
-    
