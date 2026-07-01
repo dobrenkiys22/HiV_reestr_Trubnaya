@@ -6,6 +6,7 @@ import time
 import threading
 import uuid
 from io import BytesIO
+from datetime import datetime
 
 import openpyxl
 from flask import Flask, request
@@ -277,12 +278,12 @@ def recognize_invoice(images_base64, caption=""):
     raise last_error
 
 
-def write_to_sheet(postavshik, date, summa, pokupatel=""):
+def write_to_sheet(postavshik, date, summa, pokupatel="", nomer=""):
     params = {
         "sheet": SHEET_NAME,
         "supplier": postavshik,
         "date": date,
-        "nomer": "",
+        "nomer": nomer,
         "summa": summa if summa is not None else "",
         "kommentarii": "",
     }
@@ -404,8 +405,98 @@ def proceed_after_supplier_chosen(chat_id, entry, chosen_postavshik):
         tg_send_message(chat_id, f"❌ Ошибка записи в таблицу: {result.get('message')}")
 
 
+CHEESE_SUPPLIER_NAME = "Амоев"
+CHEESE_CAPTION_RE = re.compile(r"^\s*сыр(?:ы|а|ов)?(?=\s|$|[^а-яёА-ЯЁ])", re.IGNORECASE)
+CHEESE_DATE_RE = re.compile(r"(\d{1,2})[.\/](\d{1,2})(?:[.\/](\d{2,4}))?")
+
+
+def is_cheese_invoice_caption(caption):
+    """Бармены на сыр от Амоева присылают рукописную накладную без обычных реквизитов
+    поставщика, просто с подписью 'сыр' / 'сыры' + дата — эти сообщения обрабатываем
+    отдельным путём, не через обычное распознавание поставщика/суммы."""
+    return bool(CHEESE_CAPTION_RE.match(caption or ""))
+
+
+def extract_date_from_caption(caption):
+    """Достаёт дату вида ДД.ММ или ДД.ММ.ГГГГ из подписи бармена (например 'Сыр 30.06').
+    Если год не указан — берёт текущий год. Возвращает строку 'ДД.MM.ГГГГ' или None."""
+    m = CHEESE_DATE_RE.search(caption or "")
+    if not m:
+        return None
+    day, month, year = m.group(1), m.group(2), m.group(3)
+    try:
+        day_i, month_i = int(day), int(month)
+    except ValueError:
+        return None
+    if not (1 <= day_i <= 31 and 1 <= month_i <= 12):
+        return None
+    if year:
+        year_i = int(year)
+        if year_i < 100:
+            year_i += 2000
+    else:
+        year_i = datetime.now().year
+    return f"{day_i:02d}.{month_i:02d}.{year_i}"
+
+
+def process_cheese_invoice(images_base64, caption):
+    """Рукописная накладная на сыр — всегда поставщик 'Амоев'. В таблицу пишем дату и
+    слово 'сыры' в номер накладной, сумму не указываем (её на таких накладных нет)."""
+    print(f"[process_cheese_invoice] обрабатываю накладную на сыр, подпись: {caption!r}", flush=True)
+    date_str = extract_date_from_caption(caption)
+
+    if not date_str:
+        print("[process_cheese_invoice] дата не найдена в подписи, прошу ИИ прочитать её с фото", flush=True)
+        try:
+            parsed = recognize_invoice(images_base64, caption)
+            date_str = parsed.get("date")
+        except Exception as e:
+            print(f"[process_cheese_invoice] ОШИБКА распознавания даты с фото: {repr(e)}", flush=True)
+            date_str = None
+
+    if not date_str:
+        tg_send_message(
+            MANAGER_CHAT_ID,
+            "⚠️ Накладная на сыр (Амоев): не смог понять дату ни из подписи, ни с фото.\n"
+            "Пришли, пожалуйста, ещё раз с датой в подписи, например: «Сыр 30.06»",
+        )
+        return
+
+    try:
+        result = write_to_sheet(CHEESE_SUPPLIER_NAME, date_str, None, nomer="сыры")
+        print(f"[process_cheese_invoice] результат записи: {result}", flush=True)
+    except Exception as e:
+        print(f"[process_cheese_invoice] ОШИБКА записи в таблицу: {repr(e)}", flush=True)
+        tg_send_message(
+            MANAGER_CHAT_ID,
+            f"⚠️ Накладная на сыр (Амоев, дата {date_str}) распознана, но НЕ записалась в таблицу.\n"
+            f"Ошибка: {e}",
+        )
+        return
+
+    if result.get("status") == "ok":
+        tg_send_message(
+            MANAGER_CHAT_ID,
+            f"✅ Записано: {CHEESE_SUPPLIER_NAME} (сыры)\n"
+            f"Дата: {date_str}\n"
+            f"Строка {result.get('row')} в листе «{result.get('sheet')}»",
+        )
+    else:
+        tg_send_message(
+            MANAGER_CHAT_ID,
+            f"❌ Ошибка записи в таблицу: {result.get('message')}\n"
+            f"Поставщик: {CHEESE_SUPPLIER_NAME}, дата: {date_str}, номер: сыры\n"
+            f"Нужно занести вручную.",
+        )
+
+
 def process_invoice(images_base64, caption=""):
     print(f"[process_invoice] старт, фото в накладной: {len(images_base64)}, подпись: {caption!r}", flush=True)
+
+    if is_cheese_invoice_caption(caption):
+        process_cheese_invoice(images_base64, caption)
+        return
+
     try:
         parsed = recognize_invoice(images_base64, caption)
         print(f"[process_invoice] распознано: {parsed}", flush=True)
