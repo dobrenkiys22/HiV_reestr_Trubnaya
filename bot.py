@@ -726,6 +726,20 @@ def run_sverka(file_bytes):
     return resp.json()
 
 
+def _append_discrepancy_lines(lines, mism, missing, dup_buh, dup_ours, indent="  "):
+    for m in mism:
+        if m["type"] == "сумма не совпадает":
+            lines.append(f"{indent}{m['date']}: у буха {m['buhSumma']}, у нас {m['ourSumma']}")
+        else:
+            lines.append(f"{indent}{m['date']}: {m['buhSumma']} — нет в нашем реестре")
+    for mb in missing:
+        lines.append(f"{indent}{mb['date']}: {mb['summa']} — есть у нас, нет у буха")
+    for d in dup_buh:
+        lines.append(f"{indent}🔁 Возможный дубль у буха: {d['date']}, сумма {d['summa']} — встречается {d['count']} раз")
+    for d in dup_ours:
+        lines.append(f"{indent}🔁 Возможный дубль у нас: {d['date']}, сумма {d['summa']} — встречается {d['count']} раз")
+
+
 def format_sverka_summary(result):
     if result.get("status") != "ok":
         return f"❌ Ошибка сверки: {result.get('message')}"
@@ -750,6 +764,8 @@ def format_sverka_summary(result):
         lines.append("🎉 Расхождений не найдено, всё сошлось!")
     lines.append("")
 
+    PREFERRED_LABEL_ORDER = ["Бегемот", "Набойщикова"]
+
     for r in results:
         if "error" in r:
             continue
@@ -760,17 +776,26 @@ def format_sverka_summary(result):
         if not mism and not missing and not dup_buh and not dup_ours:
             continue
         lines.append(f"— {r['supplier']} —")
-        for m in mism:
-            if m["type"] == "сумма не совпадает":
-                lines.append(f"  {m['date']}: у буха {m['buhSumma']}, у нас {m['ourSumma']}")
-            else:
-                lines.append(f"  {m['date']}: {m['buhSumma']} — нет в нашем реестре")
-        for mb in missing:
-            lines.append(f"  {mb['date']}: {mb['summa']} — есть у нас, нет у буха")
-        for d in r.get("duplicatesBuh", []):
-            lines.append(f"  🔁 Возможный дубль у буха: {d['date']}, сумма {d['summa']} — встречается {d['count']} раз")
-        for d in r.get("duplicatesOurs", []):
-            lines.append(f"  🔁 Возможный дубль у нас: {d['date']}, сумма {d['summa']} — встречается {d['count']} раз")
+
+        if r.get("isDual"):
+            # Разбиваем расхождения на группы по покупателю (Бегемот / Набойщикова),
+            # чтобы не путать, к какому из двух юрлиц относится каждая строка
+            all_labels = {(item.get("label") or "не определено") for item in mism + missing + dup_buh + dup_ours}
+            ordered_labels = [l for l in PREFERRED_LABEL_ORDER if l in all_labels]
+            ordered_labels += sorted(l for l in all_labels if l not in PREFERRED_LABEL_ORDER)
+
+            for label in ordered_labels:
+                label_mism = [m for m in mism if (m.get("label") or "не определено") == label]
+                label_missing = [m for m in missing if (m.get("label") or "не определено") == label]
+                label_dup_buh = [d for d in dup_buh if (d.get("label") or "не определено") == label]
+                label_dup_ours = [d for d in dup_ours if (d.get("label") or "не определено") == label]
+                if not (label_mism or label_missing or label_dup_buh or label_dup_ours):
+                    continue
+                lines.append(f"  • {label}:")
+                _append_discrepancy_lines(lines, label_mism, label_missing, label_dup_buh, label_dup_ours, indent="    ")
+        else:
+            _append_discrepancy_lines(lines, mism, missing, dup_buh, dup_ours, indent="  ")
+
         lines.append("")
 
     if errors:
