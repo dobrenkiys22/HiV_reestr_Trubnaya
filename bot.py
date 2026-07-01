@@ -34,6 +34,36 @@ confirmations_lock = threading.Lock()
 awaiting_manual_sum = {}
 awaiting_lock = threading.Lock()
 
+# Накладные, ожидающие подтверждения НАЗВАНИЯ ПОСТАВЩИКА от менеджера (когда подпись и фото расходятся)
+pending_supplier_confirmations = {}
+supplier_confirmations_lock = threading.Lock()
+
+# Чаты, где менеджер должен прислать название поставщика вручную текстом
+awaiting_manual_supplier = {}
+awaiting_supplier_lock = threading.Lock()
+
+# Защита от повторной обработки одного и того же update_id (Telegram может повторно
+# прислать webhook, если не получил быстрый ответ — например, пока шло долгое
+# распознавание накладной). Храним недавние update_id и пропускаем дубликаты.
+processed_update_ids = {}
+processed_update_ids_lock = threading.Lock()
+PROCESSED_UPDATE_TTL = 3600  # секунд, храним час — этого достаточно для любых ретраев Telegram
+
+
+def is_duplicate_update(update_id):
+    """Возвращает True, если этот update_id уже обрабатывался (значит это дубликат/ретрай)."""
+    if update_id is None:
+        return False
+    now = time.time()
+    with processed_update_ids_lock:
+        for uid in list(processed_update_ids.keys()):
+            if now - processed_update_ids[uid] > PROCESSED_UPDATE_TTL:
+                del processed_update_ids[uid]
+        if update_id in processed_update_ids:
+            return True
+        processed_update_ids[update_id] = now
+        return False
+
 
 def tg_get_file_path(file_id):
     r = requests.get(f"{TELEGRAM_API}/getFile", params={"file_id": file_id}, timeout=30)
@@ -114,9 +144,17 @@ SYSTEM_PROMPT = (
     "в подписи написано 'грейп' — используй 'Грейп', это одно и то же название, просто на "
     "фото буквы спутаны. "
     "Если и подпись, и фото читаются, но название поставщика в них СОВЕРШЕННО разное (не "
-    "похожее, не созвучное, явно про разных поставщиков) — выбери вариант с фото как основной "
-    "источник (это первичный документ), но обязательно укажи это противоречие в kommentarii и "
-    "поставь uverennost 'low', чтобы менеджер проверил вручную. "
+    "похожее, не созвучное, явно про разных поставщиков) — НЕ выбирай и не решай сам, какое "
+    "из них верное. Вместо этого заполни postavshik своим лучшим предположением (обычно это "
+    "вариант из подписи бармена — она надёжнее), а поле postavshik_candidates заполни списком "
+    "ИЗ ДВУХ строк: сначала вариант, прочитанный в подписи бармена, затем вариант, прочитанный "
+    "на фото документа (оба варианта — ровно как ты их прочитал, без додумывания). Коротко "
+    "опиши расхождение в kommentarii и поставь uverennost 'low' — менеджеру придёт выбор "
+    "кнопками, и он сам укажет верное название. "
+    "Если подписи не было вовсе, или подпись и фото совпадают/созвучны (см. правило выше) — "
+    "никакого расхождения нет, оставляй postavshik_candidates пустым списком []. "
+    "НЕ используй postavshik_candidates просто из общей неуверенности в качестве скана — "
+    "только когда подпись и фото называют явно РАЗНЫХ поставщиков. "
     "Для ДАТЫ применяй похожую логику: если на фото дата нечитаема — ориентируйся на дату из "
     "подписи. Если подписи нет вообще — ориентируйся только на фото, это нормальная ситуация. "
     "ПРАВИЛО ПОИСКА СУММЫ: найди итоговую строку 'Всего к оплате' / 'Итого' в самом низу "
@@ -171,7 +209,8 @@ SYSTEM_PROMPT = (
     "Если поставщик — ООО 'МИЛАРИ', дополнительно определи покупателя по реквизитам покупателя/"
     "грузополучателя: должно быть 'Бегемот' или 'Набойщикова'. "
     "Ответь СТРОГО в виде JSON без markdown, без обратных кавычек и без пояснений, по схеме: "
-    '{"postavshik":string,"pokupatel":string или "","date":string в формате ДД.MM.ГГГГ,'
+    '{"postavshik":string,"postavshik_candidates":[string, ...] или [],'
+    '"pokupatel":string или "","date":string в формате ДД.MM.ГГГГ,'
     '"summa_bez_naloga":number или null,"summa_naloga":number или null,'
     '"summa":number или null,"summa_candidates":[number, ...] или [],'
     '"kommentarii":string,"uverennost":"high" или "medium" или "low"}. '
@@ -299,6 +338,72 @@ def ask_for_sum_confirmation(parsed):
     tg_send_message(MANAGER_CHAT_ID, text, reply_markup={"inline_keyboard": buttons})
 
 
+def ask_for_supplier_confirmation(parsed):
+    """Отправляет менеджеру кнопки с вариантами названия поставщика — когда подпись бармена
+    и текст на фото называют явно разных поставщиков и ИИ не может решить сам.
+    Ничего не пишет в таблицу, пока менеджер не выберет вариант."""
+    conf_id = uuid.uuid4().hex[:10]
+    candidates = [c for c in (parsed.get("postavshik_candidates") or []) if c]
+
+    with supplier_confirmations_lock:
+        pending_supplier_confirmations[conf_id] = {
+            "date": parsed.get("date", ""),
+            "pokupatel": parsed.get("pokupatel", ""),
+            "summa": parsed.get("summa"),
+            "summa_candidates": [c for c in (parsed.get("summa_candidates") or []) if c is not None],
+            "kommentarii": parsed.get("kommentarii", ""),
+            "candidates": candidates,
+        }
+
+    buttons = []
+    for idx, name in enumerate(candidates):
+        buttons.append([{"text": name, "callback_data": f"psel:{conf_id}:{idx}"}])
+    buttons.append([{"text": "✏️ Другое название (введу сам)", "callback_data": f"pman:{conf_id}"}])
+
+    text = (
+        f"🤔 Не уверен в поставщике — подпись бармена и накладная называют разных поставщиков.\n"
+        f"Дата: {parsed.get('date')}\n"
+    )
+    if parsed.get("kommentarii"):
+        text += f"📝 {parsed.get('kommentarii')}\n"
+    text += "\nВыбери верное название:"
+
+    tg_send_message(MANAGER_CHAT_ID, text, reply_markup={"inline_keyboard": buttons})
+
+
+def proceed_after_supplier_chosen(chat_id, entry, chosen_postavshik):
+    """Вызывается после того, как менеджер выбрал (или ввёл вручную) верное название поставщика.
+    Если сумма тоже была под вопросом — переходит к уточнению суммы кнопками.
+    Иначе сразу пишет накладную в таблицу."""
+    summa_candidates = entry.get("summa_candidates") or []
+    needs_sum_confirmation = bool(summa_candidates) or entry.get("summa") is None
+
+    if needs_sum_confirmation:
+        fake_parsed = {
+            "postavshik": chosen_postavshik,
+            "pokupatel": entry.get("pokupatel", ""),
+            "date": entry.get("date", ""),
+            "kommentarii": entry.get("kommentarii", ""),
+            "summa_candidates": summa_candidates,
+        }
+        ask_for_sum_confirmation(fake_parsed)
+        return
+
+    try:
+        result = write_to_sheet(chosen_postavshik, entry.get("date", ""), entry.get("summa"), entry.get("pokupatel", ""))
+    except Exception as e:
+        tg_send_message(chat_id, f"⚠️ Не удалось записать в таблицу: {e}")
+        return
+
+    if result.get("status") == "ok":
+        tg_send_message(
+            chat_id,
+            format_success_message(chosen_postavshik, entry.get("pokupatel", ""), entry.get("date", ""), entry.get("summa"), result),
+        )
+    else:
+        tg_send_message(chat_id, f"❌ Ошибка записи в таблицу: {result.get('message')}")
+
+
 def process_invoice(images_base64, caption=""):
     print(f"[process_invoice] старт, фото в накладной: {len(images_base64)}, подпись: {caption!r}", flush=True)
     try:
@@ -307,6 +412,12 @@ def process_invoice(images_base64, caption=""):
     except Exception as e:
         print(f"[process_invoice] ОШИБКА распознавания: {repr(e)}", flush=True)
         tg_send_message(MANAGER_CHAT_ID, f"⚠️ Не удалось распознать накладную.\nОшибка: {e}")
+        return
+
+    supplier_candidates = [c for c in (parsed.get("postavshik_candidates") or []) if c]
+    if supplier_candidates:
+        print(f"[process_invoice] нужна ручная проверка поставщика, кандидаты: {supplier_candidates}", flush=True)
+        ask_for_supplier_confirmation(parsed)
         return
 
     candidates = [c for c in (parsed.get("summa_candidates") or []) if c is not None]
@@ -412,6 +523,32 @@ def handle_callback_query(cq):
         with awaiting_lock:
             awaiting_manual_sum[chat_id] = conf_id
         tg_send_message(chat_id, "Напиши правильную сумму одним сообщением (например: 12345.67)")
+
+    elif data.startswith("psel:"):
+        _, conf_id, idx_str = data.split(":")
+        idx = int(idx_str)
+        with supplier_confirmations_lock:
+            entry = pending_supplier_confirmations.pop(conf_id, None)
+        if not entry:
+            tg_send_message(chat_id, "⚠️ Эта накладная уже обработана или устарела.")
+            return
+        try:
+            chosen_name = entry["candidates"][idx]
+        except IndexError:
+            tg_send_message(chat_id, "⚠️ Не удалось определить выбранный вариант.")
+            return
+        proceed_after_supplier_chosen(chat_id, entry, chosen_name)
+
+    elif data.startswith("pman:"):
+        _, conf_id = data.split(":")
+        with supplier_confirmations_lock:
+            entry = pending_supplier_confirmations.get(conf_id)
+        if not entry:
+            tg_send_message(chat_id, "⚠️ Эта накладная уже обработана или устарела.")
+            return
+        with awaiting_supplier_lock:
+            awaiting_manual_supplier[chat_id] = conf_id
+        tg_send_message(chat_id, "Напиши правильное название поставщика одним сообщением")
 
 
 def finalize_confirmed_invoice(chat_id, entry, chosen_summa):
@@ -553,6 +690,20 @@ def format_sverka_summary(result):
     return "\n".join(lines)
 
 
+def process_sverka_file(chat_id, file_id):
+    """Фоновая обработка присланного файла сверки — вынесена из webhook, чтобы
+    сам webhook отвечал Telegram мгновенно и не провоцировал повторную отправку update."""
+    try:
+        file_path = tg_get_file_path(file_id)
+        file_bytes = tg_download_file(file_path)
+        result = run_sverka(file_bytes)
+        summary = format_sverka_summary(result)
+        send_long_message(chat_id, summary)
+    except Exception as e:
+        print(f"[process_sverka_file] ОШИБКА сверки: {repr(e)}", flush=True)
+        tg_send_message(chat_id, f"⚠️ Не удалось выполнить сверку: {e}")
+
+
 def send_long_message(chat_id, text):
     """Telegram режет сообщения длиннее ~4096 символов — разбиваем по частям."""
     LIMIT = 3800
@@ -567,6 +718,10 @@ def webhook():
     ensure_flusher_started()
     update = request.get_json(silent=True) or {}
     print(f"[webhook] получено обновление: {update}", flush=True)
+
+    if is_duplicate_update(update.get("update_id")):
+        print(f"[webhook] update_id={update.get('update_id')} уже обработан ранее — это повтор от Telegram, пропускаю", flush=True)
+        return "ok"
 
     if "callback_query" in update:
         handle_callback_query(update["callback_query"])
@@ -608,21 +763,24 @@ def webhook():
             finalize_confirmed_invoice(chat_id, entry, manual_summa)
             return "ok"
 
+        with awaiting_supplier_lock:
+            conf_id_supplier = awaiting_manual_supplier.pop(chat_id, None)
+        if conf_id_supplier:
+            with supplier_confirmations_lock:
+                entry = pending_supplier_confirmations.pop(conf_id_supplier, None)
+            if not entry:
+                tg_send_message(chat_id, "⚠️ Эта накладная уже обработана или устарела.")
+                return "ok"
+            proceed_after_supplier_chosen(chat_id, entry, text)
+            return "ok"
+
     if "photo" not in msg:
         if "document" in msg:
             doc = msg["document"]
             file_name = doc.get("file_name", "")
             if file_name.lower().endswith((".xlsx", ".xls")):
                 tg_send_message(chat_id, "🔄 Получил файл сверки, сравниваю с реестром...")
-                try:
-                    file_path = tg_get_file_path(doc["file_id"])
-                    file_bytes = tg_download_file(file_path)
-                    result = run_sverka(file_bytes)
-                    summary = format_sverka_summary(result)
-                    send_long_message(chat_id, summary)
-                except Exception as e:
-                    print(f"[webhook] ОШИБКА сверки: {repr(e)}", flush=True)
-                    tg_send_message(chat_id, f"⚠️ Не удалось выполнить сверку: {e}")
+                threading.Thread(target=process_sverka_file, args=(chat_id, doc["file_id"]), daemon=True).start()
             else:
                 tg_send_message(chat_id, "Это не похоже на xlsx-файл сверки — присылай файл от бухгалтера в формате Excel.")
         else:
@@ -653,8 +811,8 @@ def webhook():
             entry["ts"] = time.time()
         print(f"[webhook] фото добавлено в альбом {media_group_id}, всего в альбоме: {len(entry['images'])}", flush=True)
     else:
-        print("[webhook] одиночное фото, обрабатываю сразу (синхронно)", flush=True)
-        process_invoice([img_b64], caption)
+        print("[webhook] одиночное фото, запускаю обработку в фоне", flush=True)
+        threading.Thread(target=process_invoice, args=([img_b64], caption), daemon=True).start()
 
     return "ok"
 
