@@ -821,11 +821,21 @@ def process_add_supplier(chat_id, supplier_name):
         resp = requests.post(
             APPS_SCRIPT_URL,
             json={"action": "add_supplier", "supplier": supplier_name, "baseSheet": SHEET_NAME},
-            timeout=60,
+            timeout=280,
         )
         resp.raise_for_status()
         result = resp.json()
         print(f"[process_add_supplier] результат: {result}", flush=True)
+    except requests.exceptions.Timeout:
+        print("[process_add_supplier] тайм-аут запроса (Apps Script мог всё же доработать)", flush=True)
+        tg_send_message(
+            chat_id,
+            "⚠️ Не дождался ответа от Google Таблиц за отведённое время. Операция может "
+            "быть долгой (обрабатывает сразу несколько листов-месяцев) — она могла "
+            "выполниться, несмотря на тайм-аут. Проверь, пожалуйста, таблицу вручную, "
+            "прежде чем пробовать снова — чтобы не создать поставщика дважды.",
+        )
+        return
     except Exception as e:
         print(f"[process_add_supplier] ОШИБКА запроса: {repr(e)}", flush=True)
         tg_send_message(chat_id, f"⚠️ Не удалось создать поставщика: {e}")
