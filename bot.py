@@ -409,6 +409,13 @@ CHEESE_SUPPLIER_NAME = "Амоев"
 CHEESE_CAPTION_RE = re.compile(r"^\s*сыр(?:ы|а|ов)?(?=\s|$|[^а-яёА-ЯЁ])", re.IGNORECASE)
 CHEESE_DATE_RE = re.compile(r"(\d{1,2})[.\/](\d{1,2})(?:[.\/](\d{2,4}))?")
 
+# Команда менеджера на создание нового поставщика: "Новый поставщик: Название",
+# "новый поставщик Название", "нового поставщика: Название" и т.п.
+NEW_SUPPLIER_RE = re.compile(
+    r"^\s*нов(?:ый|ого|ая|ое)?\s+постав(?:щика|щику|щик)\s*[:\-]?\s*(.*)$",
+    re.IGNORECASE | re.DOTALL,
+)
+
 
 def is_cheese_invoice_caption(caption):
     """Бармены на сыр от Амоева присылают рукописную накладную без обычных реквизитов
@@ -806,6 +813,41 @@ def format_sverka_summary(result):
     return "\n".join(lines)
 
 
+def process_add_supplier(chat_id, supplier_name):
+    """Создаёт новый блок поставщика (4 колонки: дата/номер/сумма/комментарии) на текущем
+    рабочем месяце и на всех подготовленных будущих месяцах, плюс добавляет строку в
+    сводную таблицу «РЫНОК» на каждом из этих листов."""
+    try:
+        resp = requests.post(
+            APPS_SCRIPT_URL,
+            json={"action": "add_supplier", "supplier": supplier_name, "baseSheet": SHEET_NAME},
+            timeout=60,
+        )
+        resp.raise_for_status()
+        result = resp.json()
+        print(f"[process_add_supplier] результат: {result}", flush=True)
+    except Exception as e:
+        print(f"[process_add_supplier] ОШИБКА запроса: {repr(e)}", flush=True)
+        tg_send_message(chat_id, f"⚠️ Не удалось создать поставщика: {e}")
+        return
+
+    if result.get("status") != "ok":
+        tg_send_message(chat_id, f"❌ Ошибка: {result.get('message')}")
+        return
+
+    lines = [f"✅ Поставщик «{supplier_name}» добавлен:"]
+    for sh in result.get("sheets", []):
+        name = sh.get("sheet")
+        status = sh.get("status")
+        if status == "ok":
+            lines.append(f"  • {name}: колонка {sh.get('column')} ✅")
+        elif status == "skipped":
+            lines.append(f"  • {name}: {sh.get('message')}")
+        else:
+            lines.append(f"  • {name}: ошибка — {sh.get('message')}")
+    tg_send_message(chat_id, "\n".join(lines))
+
+
 def process_sverka_file(chat_id, file_id):
     """Фоновая обработка присланного файла сверки — вынесена из webhook, чтобы
     сам webhook отвечал Telegram мгновенно и не провоцировал повторную отправку update."""
@@ -860,6 +902,26 @@ def webhook():
                 "Если накладная на несколько страниц — отправляй фото как альбом (выбери все сразу).",
             )
             return "ok"
+
+        if str(chat_id) == str(MANAGER_CHAT_ID):
+            m = NEW_SUPPLIER_RE.match(text)
+            if m:
+                new_supplier_name = m.group(1).strip()
+                if not new_supplier_name:
+                    tg_send_message(
+                        chat_id,
+                        "Напиши название после команды, например: «Новый поставщик: Кока-Кола»",
+                    )
+                    return "ok"
+                tg_send_message(
+                    chat_id,
+                    f"🔄 Создаю таблицу для «{new_supplier_name}» — на текущем и всех "
+                    f"подготовленных будущих месяцах...",
+                )
+                threading.Thread(
+                    target=process_add_supplier, args=(chat_id, new_supplier_name), daemon=True
+                ).start()
+                return "ok"
 
         with awaiting_lock:
             conf_id = awaiting_manual_sum.pop(chat_id, None)
