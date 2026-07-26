@@ -90,6 +90,42 @@ def tg_send_message(chat_id, text, reply_markup=None):
         return None
 
 
+def tg_send_photo(chat_id, file_id):
+    try:
+        r = requests.post(f"{TELEGRAM_API}/sendPhoto", json={"chat_id": chat_id, "photo": file_id}, timeout=15)
+        return r.json()
+    except Exception as e:
+        print("Не удалось отправить фото в Telegram:", e)
+        return None
+
+
+def tg_send_media_group(chat_id, file_ids):
+    media = [{"type": "photo", "media": fid} for fid in file_ids]
+    try:
+        r = requests.post(
+            f"{TELEGRAM_API}/sendMediaGroup", json={"chat_id": chat_id, "media": media}, timeout=15
+        )
+        return r.json()
+    except Exception as e:
+        print("Не удалось отправить альбом в Telegram:", e)
+        return None
+
+
+def tg_send_invoice_photos(chat_id, file_ids):
+    """Пересылает исходное фото(ы) накладной обратно менеджеру — чтобы было проще
+    визуально сверить конкретную запись прямо в чате, особенно если по ней есть
+    вопросы (неуверенность в сумме/поставщике или ошибка распознавания).
+    Используем уже загруженный в Telegram file_id — это не требует повторной
+    загрузки файла и не тратит лишних ресурсов."""
+    file_ids = [f for f in (file_ids or []) if f]
+    if not file_ids:
+        return
+    if len(file_ids) == 1:
+        tg_send_photo(chat_id, file_ids[0])
+    else:
+        tg_send_media_group(chat_id, file_ids)
+
+
 def tg_answer_callback_query(callback_query_id, text=None):
     try:
         payload = {"callback_query_id": callback_query_id}
@@ -306,7 +342,7 @@ def format_success_message(postavshik, pokupatel, date, summa, result, extra_not
     )
 
 
-def ask_for_sum_confirmation(parsed):
+def ask_for_sum_confirmation(parsed, file_ids=None):
     """Отправляет менеджеру кнопки с вариантами суммы, ничего не записывая в таблицу пока."""
     conf_id = uuid.uuid4().hex[:10]
     candidates = parsed.get("summa_candidates") or []
@@ -318,6 +354,7 @@ def ask_for_sum_confirmation(parsed):
             "pokupatel": parsed.get("pokupatel", ""),
             "date": parsed.get("date", ""),
             "candidates": candidates,
+            "file_ids": file_ids or [],
         }
 
     buttons = []
@@ -336,10 +373,11 @@ def ask_for_sum_confirmation(parsed):
         text += f"📝 {parsed.get('kommentarii')}\n"
     text += "\nВыбери верную сумму:"
 
+    tg_send_invoice_photos(MANAGER_CHAT_ID, file_ids)
     tg_send_message(MANAGER_CHAT_ID, text, reply_markup={"inline_keyboard": buttons})
 
 
-def ask_for_supplier_confirmation(parsed):
+def ask_for_supplier_confirmation(parsed, file_ids=None):
     """Отправляет менеджеру кнопки с вариантами названия поставщика — когда подпись бармена
     и текст на фото называют явно разных поставщиков и ИИ не может решить сам.
     Ничего не пишет в таблицу, пока менеджер не выберет вариант."""
@@ -354,6 +392,7 @@ def ask_for_supplier_confirmation(parsed):
             "summa_candidates": [c for c in (parsed.get("summa_candidates") or []) if c is not None],
             "kommentarii": parsed.get("kommentarii", ""),
             "candidates": candidates,
+            "file_ids": file_ids or [],
         }
 
     buttons = []
@@ -369,6 +408,7 @@ def ask_for_supplier_confirmation(parsed):
         text += f"📝 {parsed.get('kommentarii')}\n"
     text += "\nВыбери верное название:"
 
+    tg_send_invoice_photos(MANAGER_CHAT_ID, file_ids)
     tg_send_message(MANAGER_CHAT_ID, text, reply_markup={"inline_keyboard": buttons})
 
 
@@ -387,15 +427,17 @@ def proceed_after_supplier_chosen(chat_id, entry, chosen_postavshik):
             "kommentarii": entry.get("kommentarii", ""),
             "summa_candidates": summa_candidates,
         }
-        ask_for_sum_confirmation(fake_parsed)
+        ask_for_sum_confirmation(fake_parsed, entry.get("file_ids"))
         return
 
     try:
         result = write_to_sheet(chosen_postavshik, entry.get("date", ""), entry.get("summa"), entry.get("pokupatel", ""))
     except Exception as e:
+        tg_send_invoice_photos(chat_id, entry.get("file_ids"))
         tg_send_message(chat_id, f"⚠️ Не удалось записать в таблицу: {e}")
         return
 
+    tg_send_invoice_photos(chat_id, entry.get("file_ids"))
     if result.get("status") == "ok":
         tg_send_message(
             chat_id,
@@ -414,6 +456,13 @@ CHEESE_DATE_RE = re.compile(r"(\d{1,2})[.\/](\d{1,2})(?:[.\/](\d{2,4}))?")
 NEW_SUPPLIER_RE = re.compile(
     r"^\s*нов(?:ый|ого|ая|ое)?\s+постав(?:щика|щику|щик)\s*[:\-]?\s*(.*)$",
     re.IGNORECASE | re.DOTALL,
+)
+
+# Команда менеджера на "причёсывание" таблицы — убрать пустые строки внутри
+# блоков поставщиков, оставшиеся после ручного удаления дублей при сверке.
+CLEANUP_RE = re.compile(
+    r"^\s*(убрать пустые строки|почисти(?:ть)?\s+таблицу|причеши(?:ть)?\s+таблицу|причесать\s+таблицу)\s*$",
+    re.IGNORECASE,
 )
 
 
@@ -446,7 +495,7 @@ def extract_date_from_caption(caption):
     return f"{day_i:02d}.{month_i:02d}.{year_i}"
 
 
-def process_cheese_invoice(images_base64, caption):
+def process_cheese_invoice(images_base64, caption, file_ids=None):
     """Рукописная накладная на сыр — всегда поставщик 'Амоев'. В таблицу пишем дату и
     слово 'сыры' в номер накладной, сумму не указываем (её на таких накладных нет)."""
     print(f"[process_cheese_invoice] обрабатываю накладную на сыр, подпись: {caption!r}", flush=True)
@@ -462,6 +511,7 @@ def process_cheese_invoice(images_base64, caption):
             date_str = None
 
     if not date_str:
+        tg_send_invoice_photos(MANAGER_CHAT_ID, file_ids)
         tg_send_message(
             MANAGER_CHAT_ID,
             "⚠️ Накладная на сыр (Амоев): не смог понять дату ни из подписи, ни с фото.\n"
@@ -474,6 +524,7 @@ def process_cheese_invoice(images_base64, caption):
         print(f"[process_cheese_invoice] результат записи: {result}", flush=True)
     except Exception as e:
         print(f"[process_cheese_invoice] ОШИБКА записи в таблицу: {repr(e)}", flush=True)
+        tg_send_invoice_photos(MANAGER_CHAT_ID, file_ids)
         tg_send_message(
             MANAGER_CHAT_ID,
             f"⚠️ Накладная на сыр (Амоев, дата {date_str}) распознана, но НЕ записалась в таблицу.\n"
@@ -481,6 +532,7 @@ def process_cheese_invoice(images_base64, caption):
         )
         return
 
+    tg_send_invoice_photos(MANAGER_CHAT_ID, file_ids)
     if result.get("status") == "ok":
         tg_send_message(
             MANAGER_CHAT_ID,
@@ -497,11 +549,11 @@ def process_cheese_invoice(images_base64, caption):
         )
 
 
-def process_invoice(images_base64, caption=""):
+def process_invoice(images_base64, caption="", file_ids=None):
     print(f"[process_invoice] старт, фото в накладной: {len(images_base64)}, подпись: {caption!r}", flush=True)
 
     if is_cheese_invoice_caption(caption):
-        process_cheese_invoice(images_base64, caption)
+        process_cheese_invoice(images_base64, caption, file_ids)
         return
 
     try:
@@ -509,13 +561,14 @@ def process_invoice(images_base64, caption=""):
         print(f"[process_invoice] распознано: {parsed}", flush=True)
     except Exception as e:
         print(f"[process_invoice] ОШИБКА распознавания: {repr(e)}", flush=True)
+        tg_send_invoice_photos(MANAGER_CHAT_ID, file_ids)
         tg_send_message(MANAGER_CHAT_ID, f"⚠️ Не удалось распознать накладную.\nОшибка: {e}")
         return
 
     supplier_candidates = [c for c in (parsed.get("postavshik_candidates") or []) if c]
     if supplier_candidates:
         print(f"[process_invoice] нужна ручная проверка поставщика, кандидаты: {supplier_candidates}", flush=True)
-        ask_for_supplier_confirmation(parsed)
+        ask_for_supplier_confirmation(parsed, file_ids)
         return
 
     candidates = [c for c in (parsed.get("summa_candidates") or []) if c is not None]
@@ -523,7 +576,7 @@ def process_invoice(images_base64, caption=""):
 
     if needs_confirmation:
         print(f"[process_invoice] нужна ручная проверка суммы, кандидаты: {candidates}", flush=True)
-        ask_for_sum_confirmation(parsed)
+        ask_for_sum_confirmation(parsed, file_ids)
         return
 
     try:
@@ -536,6 +589,7 @@ def process_invoice(images_base64, caption=""):
         print(f"[process_invoice] результат записи: {result}", flush=True)
     except Exception as e:
         print(f"[process_invoice] ОШИБКА записи в таблицу: {repr(e)}", flush=True)
+        tg_send_invoice_photos(MANAGER_CHAT_ID, file_ids)
         tg_send_message(
             MANAGER_CHAT_ID,
             f"⚠️ Накладная распознана, но НЕ записалась в таблицу.\n"
@@ -543,6 +597,7 @@ def process_invoice(images_base64, caption=""):
         )
         return
 
+    tg_send_invoice_photos(MANAGER_CHAT_ID, file_ids)
     if result.get("status") == "ok":
         extra_note = ""
         if parsed.get("uverennost") in ("low", "medium"):
@@ -578,11 +633,15 @@ def album_flusher():
                 for gid in list(pending_albums.keys()):
                     entry = pending_albums[gid]
                     if now - entry["ts"] > ALBUM_FLUSH_DELAY:
-                        to_process.append({"images": entry["images"], "caption": entry["caption"]})
+                        to_process.append({
+                            "images": entry["images"],
+                            "file_ids": entry.get("file_ids", []),
+                            "caption": entry["caption"],
+                        })
                         del pending_albums[gid]
             for entry_data in to_process:
                 print(f"[album_flusher] обрабатываю альбом, фото: {len(entry_data['images'])}, подпись: {entry_data['caption']!r}", flush=True)
-                process_invoice(entry_data["images"], entry_data["caption"])
+                process_invoice(entry_data["images"], entry_data["caption"], entry_data["file_ids"])
         except Exception as e:
             print(f"[album_flusher] ОШИБКА в фоновом потоке: {repr(e)}", flush=True)
 
@@ -654,9 +713,11 @@ def finalize_confirmed_invoice(chat_id, entry, chosen_summa):
         result = write_to_sheet(entry["postavshik"], entry["date"], chosen_summa, entry["pokupatel"])
         print(f"[finalize_confirmed_invoice] результат записи: {result}", flush=True)
     except Exception as e:
+        tg_send_invoice_photos(chat_id, entry.get("file_ids"))
         tg_send_message(chat_id, f"⚠️ Не удалось записать в таблицу: {e}")
         return
 
+    tg_send_invoice_photos(chat_id, entry.get("file_ids"))
     if result.get("status") == "ok":
         tg_send_message(
             chat_id,
@@ -858,6 +919,55 @@ def process_add_supplier(chat_id, supplier_name):
     tg_send_message(chat_id, "\n".join(lines))
 
 
+def process_cleanup_sheet(chat_id):
+    """Убирает пустые строки внутри блоков всех поставщиков на текущем рабочем листе —
+    накладные внутри каждого блока становятся подряд по дате, без дыр. Полезно после
+    сверки с бухгалтером, если много дублей удалялось вручную."""
+    try:
+        resp = requests.post(
+            APPS_SCRIPT_URL,
+            json={"action": "cleanup", "sheet": SHEET_NAME},
+            timeout=120,
+        )
+        resp.raise_for_status()
+        result = resp.json()
+        print(f"[process_cleanup_sheet] результат: {result}", flush=True)
+    except requests.exceptions.Timeout:
+        print("[process_cleanup_sheet] тайм-аут запроса", flush=True)
+        tg_send_message(
+            chat_id,
+            "⚠️ Не дождался ответа от Google Таблиц за отведённое время. Проверь, "
+            "пожалуйста, таблицу вручную — операция могла всё же выполниться.",
+        )
+        return
+    except Exception as e:
+        print(f"[process_cleanup_sheet] ОШИБКА запроса: {repr(e)}", flush=True)
+        tg_send_message(chat_id, f"⚠️ Не удалось почистить таблицу: {e}")
+        return
+
+    if result.get("status") != "ok":
+        tg_send_message(chat_id, f"❌ Ошибка: {result.get('message')}")
+        return
+
+    fixed = result.get("gapsFixed", [])
+    if not fixed:
+        tg_send_message(
+            chat_id,
+            f"✅ Проверил лист «{result.get('sheet')}» ({result.get('totalBlocks')} блоков) — "
+            f"пустых строк внутри данных не нашёл, всё уже подряд.",
+        )
+        return
+
+    lines = [
+        f"✅ Причесал лист «{result.get('sheet')}»: "
+        f"{len(fixed)} из {result.get('totalBlocks')} блоков содержали пустые строки — убрал:",
+    ]
+    for f in fixed:
+        label = f" ({f['label']})" if f.get("label") else ""
+        lines.append(f"  • {f['supplier']}{label}: {f['count']} накладных, теперь подряд")
+    tg_send_message(chat_id, "\n".join(lines))
+
+
 def process_sverka_file(chat_id, file_id):
     """Фоновая обработка присланного файла сверки — вынесена из webhook, чтобы
     сам webhook отвечал Telegram мгновенно и не провоцировал повторную отправку update."""
@@ -956,6 +1066,13 @@ def webhook():
                 ).start()
                 return "ok"
 
+            if CLEANUP_RE.match(text):
+                tg_send_message(chat_id, "🔄 Проверяю таблицу на пустые строки...")
+                threading.Thread(
+                    target=process_cleanup_sheet, args=(chat_id,), daemon=True
+                ).start()
+                return "ok"
+
         with awaiting_lock:
             conf_id = awaiting_manual_sum.pop(chat_id, None)
         if conf_id:
@@ -1015,15 +1132,20 @@ def webhook():
 
     if media_group_id:
         with albums_lock:
-            entry = pending_albums.setdefault(media_group_id, {"images": [], "caption": "", "ts": time.time()})
+            entry = pending_albums.setdefault(
+                media_group_id, {"images": [], "file_ids": [], "caption": "", "ts": time.time()}
+            )
             entry["images"].append(img_b64)
+            entry["file_ids"].append(file_id)
             if caption:
                 entry["caption"] = caption
             entry["ts"] = time.time()
         print(f"[webhook] фото добавлено в альбом {media_group_id}, всего в альбоме: {len(entry['images'])}", flush=True)
     else:
         print("[webhook] одиночное фото, запускаю обработку в фоне", flush=True)
-        threading.Thread(target=process_invoice, args=([img_b64], caption), daemon=True).start()
+        threading.Thread(
+            target=process_invoice, args=([img_b64], caption, [file_id]), daemon=True
+        ).start()
 
     return "ok"
 
