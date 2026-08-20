@@ -18,7 +18,7 @@ TELEGRAM_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 APPS_SCRIPT_URL = os.environ["APPS_SCRIPT_URL"]
 MANAGER_CHAT_ID = os.environ["MANAGER_CHAT_ID"]
-SHEET_NAME = os.environ.get("SHEET_NAME", "июнь 2026")
+SHEET_NAME = os.environ.get("SHEET_NAME", "август 2026")
 
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 
