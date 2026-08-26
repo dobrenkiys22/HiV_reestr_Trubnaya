@@ -18,7 +18,7 @@ TELEGRAM_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 APPS_SCRIPT_URL = os.environ["APPS_SCRIPT_URL"]
 MANAGER_CHAT_ID = os.environ["MANAGER_CHAT_ID"]
-SHEET_NAME = os.environ.get("SHEET_NAME", "август 2026")
+SHEET_NAME = os.environ.get("SHEET_NAME", "июнь 2026")
 
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 
@@ -42,6 +42,11 @@ supplier_confirmations_lock = threading.Lock()
 # Чаты, где менеджер должен прислать название поставщика вручную текстом
 awaiting_manual_supplier = {}
 awaiting_supplier_lock = threading.Lock()
+
+# Чаты менеджера, где после нажатия кнопки "➕ Добавить поставщика" ждём,
+# что следующим сообщением придёт название нового поставщика
+awaiting_new_supplier_name = set()
+awaiting_new_supplier_lock = threading.Lock()
 
 # Защита от повторной обработки одного и того же update_id (Telegram может повторно
 # прислать webhook, если не получил быстрый ответ — например, пока шло долгое
@@ -874,6 +879,22 @@ def format_sverka_summary(result):
     return "\n".join(lines)
 
 
+def start_add_supplier_flow(chat_id, raw_name):
+    """Запускает создание нового поставщика — общая точка входа что для текстовой
+    команды "Новый поставщик: Название", что для кнопки "➕ Добавить поставщика"
+    (после которой название приходит следующим сообщением)."""
+    new_supplier_name = (raw_name or "").strip()
+    if not new_supplier_name:
+        tg_send_message(chat_id, "Название пустое — напиши, пожалуйста, название поставщика.")
+        return
+    tg_send_message(
+        chat_id,
+        f"🔄 Создаю таблицу для «{new_supplier_name}» — на текущем и всех "
+        f"подготовленных будущих месяцах...",
+    )
+    threading.Thread(target=process_add_supplier, args=(chat_id, new_supplier_name), daemon=True).start()
+
+
 def process_add_supplier(chat_id, supplier_name):
     """Создаёт новый блок поставщика (4 колонки: дата/номер/сумма/комментарии) на текущем
     рабочем месяце и на всех подготовленных будущих месяцах, плюс добавляет строку в
@@ -1017,20 +1038,33 @@ def webhook():
         text = msg["text"].strip()
 
         WAKE_BUTTON_TEXT = "☕ Разбудить бота"
+        ADD_SUPPLIER_BUTTON_TEXT = "➕ Добавить поставщика"
+        is_manager = str(chat_id) == str(MANAGER_CHAT_ID)
+
         WAKE_KEYBOARD = {
             "keyboard": [[{"text": WAKE_BUTTON_TEXT}]],
             "resize_keyboard": True,
             "is_persistent": True,
         }
+        MANAGER_KEYBOARD = {
+            "keyboard": [[{"text": WAKE_BUTTON_TEXT}], [{"text": ADD_SUPPLIER_BUTTON_TEXT}]],
+            "resize_keyboard": True,
+            "is_persistent": True,
+        }
+        active_keyboard = MANAGER_KEYBOARD if is_manager else WAKE_KEYBOARD
 
         if text == "/start":
+            extra = (
+                "\n\nКнопка «➕ Добавить поставщика» — создать новую колонку в таблице "
+                "для нового поставщика." if is_manager else ""
+            )
             tg_send_message(
                 chat_id,
                 "Привет! Присылай сюда фото накладных — я распознаю и сам занесу в реестр. "
                 "Если накладная на несколько страниц — отправляй фото как альбом (выбери все сразу).\n\n"
                 "Если давно не пользовался ботом — нажми кнопку «☕ Разбудить бота» внизу и подожди "
-                "ответ, прежде чем слать накладные (сервер иногда «засыпает» после простоя).",
-                reply_markup=WAKE_KEYBOARD,
+                "ответ, прежде чем слать накладные (сервер иногда «засыпает» после простоя)." + extra,
+                reply_markup=active_keyboard,
             )
             return "ok"
 
@@ -1042,28 +1076,27 @@ def webhook():
             tg_send_message(
                 chat_id,
                 "✅ Готов принимать накладные — можешь скидывать фото.",
-                reply_markup=WAKE_KEYBOARD,
+                reply_markup=active_keyboard,
             )
             return "ok"
 
-        if str(chat_id) == str(MANAGER_CHAT_ID):
+        if is_manager:
+            with awaiting_new_supplier_lock:
+                was_awaiting_name = chat_id in awaiting_new_supplier_name
+                awaiting_new_supplier_name.discard(chat_id)
+            if was_awaiting_name:
+                start_add_supplier_flow(chat_id, text)
+                return "ok"
+
+            if text == ADD_SUPPLIER_BUTTON_TEXT:
+                with awaiting_new_supplier_lock:
+                    awaiting_new_supplier_name.add(chat_id)
+                tg_send_message(chat_id, "Напиши название нового поставщика:")
+                return "ok"
+
             m = NEW_SUPPLIER_RE.match(text)
             if m:
-                new_supplier_name = m.group(1).strip()
-                if not new_supplier_name:
-                    tg_send_message(
-                        chat_id,
-                        "Напиши название после команды, например: «Новый поставщик: Кока-Кола»",
-                    )
-                    return "ok"
-                tg_send_message(
-                    chat_id,
-                    f"🔄 Создаю таблицу для «{new_supplier_name}» — на текущем и всех "
-                    f"подготовленных будущих месяцах...",
-                )
-                threading.Thread(
-                    target=process_add_supplier, args=(chat_id, new_supplier_name), daemon=True
-                ).start()
+                start_add_supplier_flow(chat_id, m.group(1))
                 return "ok"
 
             if CLEANUP_RE.match(text):
