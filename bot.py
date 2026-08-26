@@ -319,6 +319,17 @@ def recognize_invoice(images_base64, caption=""):
     raise last_error
 
 
+def timeout_hint(e):
+    """Если ошибка записи — именно тайм-аут (а не отказ Apps Script), операция могла
+    всё же выполниться на стороне Google — HTTP-клиент просто не дождался ответа."""
+    if isinstance(e, requests.exceptions.Timeout):
+        return (
+            "\n⏱ Это похоже на тайм-аут — операция могла всё же выполниться. "
+            "Проверь, пожалуйста, таблицу вручную, прежде чем заносить эту накладную ещё раз."
+        )
+    return ""
+
+
 def write_to_sheet(postavshik, date, summa, pokupatel="", nomer=""):
     params = {
         "sheet": SHEET_NAME,
@@ -331,7 +342,7 @@ def write_to_sheet(postavshik, date, summa, pokupatel="", nomer=""):
     if pokupatel:
         params["pokupatel"] = pokupatel
 
-    r = requests.get(APPS_SCRIPT_URL, params=params, timeout=30)
+    r = requests.get(APPS_SCRIPT_URL, params=params, timeout=90)
     r.raise_for_status()
     return r.json()
 
@@ -439,7 +450,7 @@ def proceed_after_supplier_chosen(chat_id, entry, chosen_postavshik):
         result = write_to_sheet(chosen_postavshik, entry.get("date", ""), entry.get("summa"), entry.get("pokupatel", ""))
     except Exception as e:
         tg_send_invoice_photos(chat_id, entry.get("file_ids"))
-        tg_send_message(chat_id, f"⚠️ Не удалось записать в таблицу: {e}")
+        tg_send_message(chat_id, f"⚠️ Не удалось записать в таблицу: {e}{timeout_hint(e)}")
         return
 
     tg_send_invoice_photos(chat_id, entry.get("file_ids"))
@@ -533,7 +544,7 @@ def process_cheese_invoice(images_base64, caption, file_ids=None):
         tg_send_message(
             MANAGER_CHAT_ID,
             f"⚠️ Накладная на сыр (Амоев, дата {date_str}) распознана, но НЕ записалась в таблицу.\n"
-            f"Ошибка: {e}",
+            f"Ошибка: {e}{timeout_hint(e)}",
         )
         return
 
@@ -598,7 +609,7 @@ def process_invoice(images_base64, caption="", file_ids=None):
         tg_send_message(
             MANAGER_CHAT_ID,
             f"⚠️ Накладная распознана, но НЕ записалась в таблицу.\n"
-            f"Ошибка: {e}\nРаспознанные данные: {parsed}",
+            f"Ошибка: {e}{timeout_hint(e)}\nРаспознанные данные: {parsed}",
         )
         return
 
@@ -719,7 +730,7 @@ def finalize_confirmed_invoice(chat_id, entry, chosen_summa):
         print(f"[finalize_confirmed_invoice] результат записи: {result}", flush=True)
     except Exception as e:
         tg_send_invoice_photos(chat_id, entry.get("file_ids"))
-        tg_send_message(chat_id, f"⚠️ Не удалось записать в таблицу: {e}")
+        tg_send_message(chat_id, f"⚠️ Не удалось записать в таблицу: {e}{timeout_hint(e)}")
         return
 
     tg_send_invoice_photos(chat_id, entry.get("file_ids"))
