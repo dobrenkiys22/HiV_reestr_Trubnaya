@@ -327,6 +327,13 @@ def timeout_hint(e):
             "\n⏱ Это похоже на тайм-аут — операция могла всё же выполниться. "
             "Проверь, пожалуйста, таблицу вручную, прежде чем заносить эту накладную ещё раз."
         )
+    if "macros/echo" in str(e) or (
+        isinstance(e, requests.exceptions.HTTPError) and getattr(e.response, "status_code", None) == 404
+    ):
+        return (
+            "\n🔁 Это сбой на стороне Google (ответ скрипта не удалось забрать) — сама запись "
+            "могла пройти. Проверь, пожалуйста, таблицу, прежде чем заносить накладную ещё раз."
+        )
     return ""
 
 
@@ -533,7 +540,7 @@ def process_cheese_invoice(images_base64, caption, file_ids=None):
             "⚠️ Накладная на сыр (Амоев): не смог понять дату ни из подписи, ни с фото.\n"
             "Пришли, пожалуйста, ещё раз с датой в подписи, например: «Сыр 30.06»",
         )
-        return
+        return "error"
 
     try:
         result = write_to_sheet(CHEESE_SUPPLIER_NAME, date_str, None, nomer="сыры")
@@ -546,7 +553,7 @@ def process_cheese_invoice(images_base64, caption, file_ids=None):
             f"⚠️ Накладная на сыр (Амоев, дата {date_str}) распознана, но НЕ записалась в таблицу.\n"
             f"Ошибка: {e}{timeout_hint(e)}",
         )
-        return
+        return "error"
 
     tg_send_invoice_photos(MANAGER_CHAT_ID, file_ids)
     if result.get("status") == "ok":
@@ -563,14 +570,32 @@ def process_cheese_invoice(images_base64, caption, file_ids=None):
             f"Поставщик: {CHEESE_SUPPLIER_NAME}, дата: {date_str}, номер: сыры\n"
             f"Нужно занести вручную.",
         )
+        return "error"
+    return "ok"
+
+
+CAPTION_DATE_RE = re.compile(r"\d{1,2}\s*[./-]\s*\d{1,2}(?:\s*[./-]\s*\d{2,4})?")
+
+
+def supplier_from_caption(caption):
+    """Название поставщика из подписи бармена («Лью 23.09» → «Лью»). Подпись — приоритетный
+    источник: бармены подписывают верно, а печатный текст ИИ может прочитать с ошибкой.
+    Возвращает None, если в подписи нет похожего на название текста."""
+    text = CAPTION_DATE_RE.sub(" ", caption or "")
+    text = re.sub(r"[^A-Za-zА-Яа-яЁё\s\"«»'-]", " ", text)
+    text = re.sub(r"\b(накладная|накладные|накл|от|за|сумма|счет|счёт)\b", " ", text, flags=re.I)
+    words = text.split()
+    if not 1 <= len(words) <= 3:
+        return None
+    name = " ".join(words).strip()
+    return name if len(name) >= 2 else None
 
 
 def process_invoice(images_base64, caption="", file_ids=None):
     print(f"[process_invoice] старт, фото в накладной: {len(images_base64)}, подпись: {caption!r}", flush=True)
 
     if is_cheese_invoice_caption(caption):
-        process_cheese_invoice(images_base64, caption, file_ids)
-        return
+        return process_cheese_invoice(images_base64, caption, file_ids)
 
     try:
         parsed = recognize_invoice(images_base64, caption)
@@ -579,13 +604,19 @@ def process_invoice(images_base64, caption="", file_ids=None):
         print(f"[process_invoice] ОШИБКА распознавания: {repr(e)}", flush=True)
         tg_send_invoice_photos(MANAGER_CHAT_ID, file_ids)
         tg_send_message(MANAGER_CHAT_ID, f"⚠️ Не удалось распознать накладную.\nОшибка: {e}")
-        return
+        return "error"
+
+    cap_name = supplier_from_caption(caption)
+    if cap_name:
+        print(f"[process_invoice] поставщик взят из подписи: {cap_name!r} (ИИ прочитал: {parsed.get('postavshik')!r})", flush=True)
+        parsed["postavshik"] = cap_name
+        parsed["postavshik_candidates"] = []
 
     supplier_candidates = [c for c in (parsed.get("postavshik_candidates") or []) if c]
     if supplier_candidates:
         print(f"[process_invoice] нужна ручная проверка поставщика, кандидаты: {supplier_candidates}", flush=True)
         ask_for_supplier_confirmation(parsed, file_ids)
-        return
+        return "pending"
 
     candidates = [c for c in (parsed.get("summa_candidates") or []) if c is not None]
     needs_confirmation = bool(candidates) or parsed.get("summa") is None
@@ -593,7 +624,7 @@ def process_invoice(images_base64, caption="", file_ids=None):
     if needs_confirmation:
         print(f"[process_invoice] нужна ручная проверка суммы, кандидаты: {candidates}", flush=True)
         ask_for_sum_confirmation(parsed, file_ids)
-        return
+        return "pending"
 
     try:
         result = write_to_sheet(
@@ -611,7 +642,7 @@ def process_invoice(images_base64, caption="", file_ids=None):
             f"⚠️ Накладная распознана, но НЕ записалась в таблицу.\n"
             f"Ошибка: {e}{timeout_hint(e)}\nРаспознанные данные: {parsed}",
         )
-        return
+        return "error"
 
     tg_send_invoice_photos(MANAGER_CHAT_ID, file_ids)
     if result.get("status") == "ok":
@@ -634,11 +665,71 @@ def process_invoice(images_base64, caption="", file_ids=None):
             f"Распознанные данные: {parsed}\n"
             f"Нужно занести эту накладную вручную.",
         )
+        return "error"
+    return "ok"
+
+
+BATCH_QUIET_DELAY = 30  # секунд тишины после последнего фото, прежде чем начать пакет
+invoice_queue = []
+queue_lock = threading.Lock()
+last_incoming_ts = 0.0
+batch_running = False
+
+
+def global_touch():
+    global last_incoming_ts
+    with queue_lock:
+        last_incoming_ts = time.time()
+
+
+def enqueue_invoice(images, caption, file_ids):
+    """Кладёт накладную в очередь и сдвигает таймер «тишины»."""
+    global last_incoming_ts
+    with queue_lock:
+        invoice_queue.append({"images": images, "caption": caption, "file_ids": file_ids})
+        last_incoming_ts = time.time()
+
+
+def _plural_nakl(n):
+    if n % 10 == 1 and n % 100 != 11:
+        return "накладная"
+    if n % 10 in (2, 3, 4) and n % 100 not in (12, 13, 14):
+        return "накладные"
+    return "накладных"
+
+
+def run_batch(batch):
+    global batch_running
+    try:
+        n = len(batch)
+        tg_send_message(MANAGER_CHAT_ID, f"📥 Получено накладных: {n}. Начинаю вносить в реестр.")
+        counts = {"ok": 0, "pending": 0, "error": 0}
+        for item in batch:
+            try:
+                status = process_invoice(item["images"], item["caption"], item["file_ids"])
+            except Exception as e:
+                print(f"[run_batch] ОШИБКА обработки накладной: {repr(e)}", flush=True)
+                try:
+                    tg_send_message(MANAGER_CHAT_ID, f"⚠️ Ошибка при обработке накладной: {e}")
+                except Exception:
+                    pass
+                status = "error"
+            counts[status if status in counts else "error"] += 1
+        lines = [f"🏁 Закончил. Внесено в реестр: {counts['ok']} из {n}."]
+        if counts["pending"]:
+            lines.append(f"⏳ Ждут вашего выбора кнопками выше: {counts['pending']}")
+        if counts["error"]:
+            lines.append(f"⚠️ Не внесены из-за ошибки (см. сообщения выше): {counts['error']}")
+        tg_send_message(MANAGER_CHAT_ID, "\n".join(lines))
+    finally:
+        with queue_lock:
+            batch_running = False
 
 
 def album_flusher():
-    """Фоновый поток: следит за накопленными альбомами фото и обрабатывает их,
-    когда новых фото в альбом не поступало некоторое время."""
+    """Фоновый поток: собирает альбомы фото, а затем запускает пакетную обработку
+    очереди накладных, когда новых фото не поступало BATCH_QUIET_DELAY секунд."""
+    global batch_running
     print("[album_flusher] фоновый поток запущен", flush=True)
     while True:
         try:
@@ -655,9 +746,21 @@ def album_flusher():
                             "caption": entry["caption"],
                         })
                         del pending_albums[gid]
+                albums_waiting = bool(pending_albums)
             for entry_data in to_process:
-                print(f"[album_flusher] обрабатываю альбом, фото: {len(entry_data['images'])}, подпись: {entry_data['caption']!r}", flush=True)
-                process_invoice(entry_data["images"], entry_data["caption"], entry_data["file_ids"])
+                print(f"[album_flusher] альбом в очередь, фото: {len(entry_data['images'])}, подпись: {entry_data['caption']!r}", flush=True)
+                enqueue_invoice(entry_data["images"], entry_data["caption"], entry_data["file_ids"])
+
+            batch = None
+            with queue_lock:
+                if (invoice_queue and not albums_waiting and not batch_running
+                        and time.time() - last_incoming_ts >= BATCH_QUIET_DELAY):
+                    batch = list(invoice_queue)
+                    invoice_queue.clear()
+                    batch_running = True
+            if batch:
+                print(f"[album_flusher] запускаю пакет из {len(batch)} накладных", flush=True)
+                threading.Thread(target=run_batch, args=(batch,), daemon=True).start()
         except Exception as e:
             print(f"[album_flusher] ОШИБКА в фоновом потоке: {repr(e)}", flush=True)
 
@@ -1184,12 +1287,11 @@ def webhook():
             if caption:
                 entry["caption"] = caption
             entry["ts"] = time.time()
+        global_touch()
         print(f"[webhook] фото добавлено в альбом {media_group_id}, всего в альбоме: {len(entry['images'])}", flush=True)
     else:
-        print("[webhook] одиночное фото, запускаю обработку в фоне", flush=True)
-        threading.Thread(
-            target=process_invoice, args=([img_b64], caption, [file_id]), daemon=True
-        ).start()
+        print("[webhook] одиночное фото, кладу в очередь", flush=True)
+        enqueue_invoice([img_b64], caption, [file_id])
 
     return "ok"
 
